@@ -1,0 +1,41 @@
+# Spark Declarative Pipeline — Silver HealthKit Layer
+#
+# Continuous-mode pipeline that reads from the ZeroBus bronze streaming table
+# and produces typed, deduplicated silver streaming tables optimized for
+# downstream metric views and KPI computation.
+#
+# Silver tables produced:
+#   - silver_health_samples     (HR, steps, SpO2, HRV, energy)
+#   - silver_workouts           (workout sessions)
+#   - silver_sleep_sessions     (sleep with stage durations)
+#   - silver_activity_summaries (daily rings + goal attainment)
+#   - silver_deletes            (deletion records for SCD)
+#
+# Mode: Continuous — processes new bronze records as they arrive.
+# Compute: Serverless (Photon-enabled).
+
+resources:
+  pipelines:
+    silver_healthkit:
+      name: "[${bundle.target}] Silver HealthKit"
+
+      catalog: ${var.catalog}
+      target: ${var.schema}
+
+      libraries:
+        - notebook:
+            path: ../src/pipelines/silver_healthkit.ipynb
+
+      serverless: true
+      continuous: true
+      development: true
+      photon: true
+      channel: current
+
+      configuration:
+        # Source bronze table — used by pipeline code
+        bronze_table: "${var.catalog}.${var.schema}.wearables_zerobus"
+
+      permissions:
+        - level: CAN_VIEW
+          group_name: "users"
