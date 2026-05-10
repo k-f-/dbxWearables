@@ -1,14 +1,15 @@
-"""Bronze Typed Layer — HealthKit Streaming Pipeline.
+"""HealthKit Pipeline — Bronze Typed → Silver (CDC-Applied).
 
 Continuous-mode Spark Declarative Pipeline that reads from the ZeroBus raw bronze
-table (wearables_zerobus) and produces typed, structured streaming tables that
-serve as the append-only audit trail for downstream CDC processing.
+table (wearables_zerobus) and produces:
 
-This layer performs VARIANT → typed column extraction only. No records are ever
-removed. Delete propagation happens at the silver layer via AUTO CDC.
+1. Bronze Typed Layer — VARIANT → typed column extraction, append-only audit trail.
+2. CDC Views — Union typed records (INSERT) with matching deletes (DELETE).
+3. Silver Layer — AUTO CDC applied (SCD Type 1 + SCD Type 2 for demo).
+4. Quarantine — Unmatched deletes captured for observability.
 
 Delta best practices applied:
-- Change Data Feed enabled (downstream CDC consumption)
+- Change Data Feed enabled (downstream incremental processing)
 - Row Tracking enabled (row-level lineage)
 - Variant Shredding enabled (where VARIANT columns exist)
 - Liquid Clustering (per-user + time-series query patterns)
@@ -31,6 +32,13 @@ BRONZE_TABLE = spark.conf.get("bronze_table")
 STAGES_ARRAY_TYPE = (
     "ARRAY<STRUCT<stage: STRING, start_date: STRING, end_date: STRING, uuid: STRING>>"
 )
+
+
+# #############################################################################
+#
+#   LAYER 1: BRONZE TYPED (append-only audit trail)
+#
+# #############################################################################
 
 
 # =============================================================================
@@ -366,8 +374,8 @@ def bronze_typed_activity_summaries():
     comment=(
         "HealthKit deletion event records. Each row is a delete event targeting "
         "a specific UUID + sample_type. Used by CDC views to feed AUTO CDC at silver. "
-        "sample_type determines target table: HKQuantityType* → health_samples, "
-        "HKWorkoutTypeIdentifier → workouts, HKCategoryTypeIdentifierSleepAnalysis → sleep_stages."
+        "sample_type determines target table: HKQuantityType* -> health_samples, "
+        "HKWorkoutTypeIdentifier -> workouts, HKCategoryTypeIdentifierSleepAnalysis -> sleep_stages."
     ),
     table_properties={
         "quality": "bronze",
@@ -399,4 +407,352 @@ def bronze_typed_deletes():
             F.expr("body:uuid::string").alias("deleted_uuid"),
             F.expr("body:sample_type::string").alias("sample_type"),
         )
+    )
+
+
+# #############################################################################
+#
+#   LAYER 2: CDC VIEWS (union typed records + matching deletes)
+#
+#   Each view produces a unified change feed with an `operation` column:
+#   - INSERT rows come from the bronze_typed table (all columns populated)
+#   - DELETE rows come from bronze_typed_deletes (only key + ingested_at + operation)
+#
+#   These views feed into dp.create_auto_cdc_flow() at the silver layer.
+#
+# #############################################################################
+
+
+@dp.view(name="cdc_health_samples_v")
+def cdc_health_samples_v():
+    """CDC feed for health samples: unions sample inserts with HKQuantityType deletes."""
+    inserts = (
+        spark.readStream.table("bronze_typed_health_samples")
+        .withColumn("operation", F.lit("INSERT"))
+    )
+    deletes = (
+        spark.readStream.table("bronze_typed_deletes")
+        .filter(
+            F.col("sample_type").startswith("HKQuantityType")
+            | (F.col("sample_type") == "HKQuantityTypeIdentifierVO2Max")
+        )
+        .select(
+            F.col("deleted_uuid").alias("uuid"),
+            F.col("ingested_at"),
+            F.lit("DELETE").alias("operation"),
+        )
+    )
+    return inserts.unionByName(deletes, allowMissingColumns=True)
+
+
+@dp.view(name="cdc_workouts_v")
+def cdc_workouts_v():
+    """CDC feed for workouts: unions workout inserts with HKWorkoutTypeIdentifier deletes."""
+    inserts = (
+        spark.readStream.table("bronze_typed_workouts")
+        .withColumn("operation", F.lit("INSERT"))
+    )
+    deletes = (
+        spark.readStream.table("bronze_typed_deletes")
+        .filter(F.col("sample_type") == "HKWorkoutTypeIdentifier")
+        .select(
+            F.col("deleted_uuid").alias("uuid"),
+            F.col("ingested_at"),
+            F.lit("DELETE").alias("operation"),
+        )
+    )
+    return inserts.unionByName(deletes, allowMissingColumns=True)
+
+
+@dp.view(name="cdc_sleep_stages_v")
+def cdc_sleep_stages_v():
+    """CDC feed for sleep stages: unions stage inserts with HKCategoryType sleep deletes."""
+    inserts = (
+        spark.readStream.table("bronze_typed_sleep_stages")
+        .withColumn("operation", F.lit("INSERT"))
+    )
+    deletes = (
+        spark.readStream.table("bronze_typed_deletes")
+        .filter(F.col("sample_type") == "HKCategoryTypeIdentifierSleepAnalysis")
+        .select(
+            F.col("deleted_uuid").alias("stage_uuid"),
+            F.col("ingested_at"),
+            F.lit("DELETE").alias("operation"),
+        )
+    )
+    return inserts.unionByName(deletes, allowMissingColumns=True)
+
+
+# #############################################################################
+#
+#   LAYER 3: SILVER (AUTO CDC applied — SCD Type 1 + Type 2)
+#
+#   Each entity gets two target tables:
+#   - SCD Type 1: current state only, deletes physically remove rows
+#   - SCD Type 2: full history with __START_AT, __END_AT, __IS_DELETED
+#
+#   Activity summaries have no deletes — simple streaming passthrough.
+#
+# #############################################################################
+
+
+# =============================================================================
+# silver_health_samples — SCD Type 1 (current state, deletes applied)
+# =============================================================================
+
+dp.create_streaming_table(
+    name="silver_health_samples",
+    comment=(
+        "Current-state health samples with deletes physically applied (SCD Type 1). "
+        "Records deleted on the source device are removed from this table. "
+        "Optimized for dashboards and metric views."
+    ),
+    table_properties={
+        "quality": "silver",
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    },
+    cluster_by=["user_id", "sample_type", "sample_date"],
+)
+
+dp.create_auto_cdc_flow(
+    target="silver_health_samples",
+    source="cdc_health_samples_v",
+    keys=["uuid"],
+    sequence_by=F.col("ingested_at"),
+    apply_as_deletes=F.expr("operation = 'DELETE'"),
+    except_column_list=["operation", "record_id"],
+    stored_as_scd_type=1,
+)
+
+
+# =============================================================================
+# silver_health_samples_history — SCD Type 2 (full change history)
+# =============================================================================
+
+dp.create_streaming_table(
+    name="silver_health_samples_history",
+    comment=(
+        "Full change history for health samples (SCD Type 2). "
+        "Includes __START_AT, __END_AT, and __IS_DELETED columns for temporal queries. "
+        "Shows when records were active and when they were deleted."
+    ),
+    table_properties={
+        "quality": "silver",
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    },
+    cluster_by=["user_id", "sample_type", "sample_date"],
+)
+
+dp.create_auto_cdc_flow(
+    target="silver_health_samples_history",
+    source="cdc_health_samples_v",
+    keys=["uuid"],
+    sequence_by=F.col("ingested_at"),
+    apply_as_deletes=F.expr("operation = 'DELETE'"),
+    except_column_list=["operation", "record_id"],
+    stored_as_scd_type=2,
+)
+
+
+# =============================================================================
+# silver_workouts — SCD Type 1 (current state, deletes applied)
+# =============================================================================
+
+dp.create_streaming_table(
+    name="silver_workouts",
+    comment=(
+        "Current-state workouts with deletes physically applied (SCD Type 1). "
+        "Deleted workouts are removed. Optimized for activity dashboards."
+    ),
+    table_properties={
+        "quality": "silver",
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    },
+    cluster_by=["user_id", "activity_type", "workout_date"],
+)
+
+dp.create_auto_cdc_flow(
+    target="silver_workouts",
+    source="cdc_workouts_v",
+    keys=["uuid"],
+    sequence_by=F.col("ingested_at"),
+    apply_as_deletes=F.expr("operation = 'DELETE'"),
+    except_column_list=["operation", "record_id"],
+    stored_as_scd_type=1,
+)
+
+
+# =============================================================================
+# silver_workouts_history — SCD Type 2 (full change history)
+# =============================================================================
+
+dp.create_streaming_table(
+    name="silver_workouts_history",
+    comment=(
+        "Full change history for workouts (SCD Type 2). "
+        "Tracks when workouts were active and when they were deleted."
+    ),
+    table_properties={
+        "quality": "silver",
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    },
+    cluster_by=["user_id", "activity_type", "workout_date"],
+)
+
+dp.create_auto_cdc_flow(
+    target="silver_workouts_history",
+    source="cdc_workouts_v",
+    keys=["uuid"],
+    sequence_by=F.col("ingested_at"),
+    apply_as_deletes=F.expr("operation = 'DELETE'"),
+    except_column_list=["operation", "record_id"],
+    stored_as_scd_type=2,
+)
+
+
+# =============================================================================
+# silver_sleep_stages — SCD Type 1 (current state, deletes applied)
+# =============================================================================
+
+dp.create_streaming_table(
+    name="silver_sleep_stages",
+    comment=(
+        "Current-state sleep stages with deletes applied (SCD Type 1). "
+        "Deleted stages are removed. Use gold_sleep_sessions for session aggregation."
+    ),
+    table_properties={
+        "quality": "silver",
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    },
+    cluster_by=["user_id", "sleep_date"],
+)
+
+dp.create_auto_cdc_flow(
+    target="silver_sleep_stages",
+    source="cdc_sleep_stages_v",
+    keys=["stage_uuid"],
+    sequence_by=F.col("ingested_at"),
+    apply_as_deletes=F.expr("operation = 'DELETE'"),
+    except_column_list=["operation", "record_id"],
+    stored_as_scd_type=1,
+)
+
+
+# =============================================================================
+# silver_sleep_stages_history — SCD Type 2 (full change history)
+# =============================================================================
+
+dp.create_streaming_table(
+    name="silver_sleep_stages_history",
+    comment=(
+        "Full change history for sleep stages (SCD Type 2). "
+        "Tracks when individual sleep stages were active and when deleted."
+    ),
+    table_properties={
+        "quality": "silver",
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    },
+    cluster_by=["user_id", "sleep_date"],
+)
+
+dp.create_auto_cdc_flow(
+    target="silver_sleep_stages_history",
+    source="cdc_sleep_stages_v",
+    keys=["stage_uuid"],
+    sequence_by=F.col("ingested_at"),
+    apply_as_deletes=F.expr("operation = 'DELETE'"),
+    except_column_list=["operation", "record_id"],
+    stored_as_scd_type=2,
+)
+
+
+# =============================================================================
+# silver_activity_summaries — streaming passthrough (no deletes exist)
+# =============================================================================
+
+
+@dp.table(
+    name="silver_activity_summaries",
+    comment=(
+        "Activity summaries passed through from bronze (no deletes exist for this type). "
+        "One row per user per day with ring values and goal attainment."
+    ),
+    table_properties={
+        "quality": "silver",
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableRowTracking": "true",
+    },
+    cluster_by=["user_id", "activity_date"],
+)
+def silver_activity_summaries():
+    return (
+        spark.readStream.table("bronze_typed_activity_summaries")
+        .drop("record_id")
+    )
+
+
+# #############################################################################
+#
+#   QUARANTINE: Unmatched deletes (observability)
+#
+#   Captures delete events whose UUID has no matching record in the target
+#   bronze typed table. Expected to be ~99% of sample deletes in dev
+#   (historical orphans from HealthKit anchored queries).
+#
+# #############################################################################
+
+
+@dp.materialized_view(
+    name="quarantine_unmatched_deletes",
+    comment=(
+        "Delete events with no matching UUID in the target table. "
+        "In dev, ~99% of sample deletes are orphans (historical). "
+        "In production, non-zero counts may indicate sync ordering issues."
+    ),
+    table_properties={
+        "quality": "quarantine",
+    },
+)
+def quarantine_unmatched_deletes():
+    deletes = spark.read.table("bronze_typed_deletes")
+    sample_uuids = spark.read.table("bronze_typed_health_samples").select(
+        F.col("uuid").alias("existing_uuid")
+    )
+    workout_uuids = spark.read.table("bronze_typed_workouts").select(
+        F.col("uuid").alias("existing_uuid")
+    )
+    stage_uuids = spark.read.table("bronze_typed_sleep_stages").select(
+        F.col("stage_uuid").alias("existing_uuid")
+    )
+    all_uuids = sample_uuids.union(workout_uuids).union(stage_uuids)
+
+    return (
+        deletes.join(
+            all_uuids,
+            deletes.deleted_uuid == all_uuids.existing_uuid,
+            "left_anti",
+        )
+        .withColumn(
+            "target_table",
+            F.when(
+                F.col("sample_type").startswith("HKQuantityType"),
+                F.lit("silver_health_samples"),
+            )
+            .when(
+                F.col("sample_type") == "HKWorkoutTypeIdentifier",
+                F.lit("silver_workouts"),
+            )
+            .when(
+                F.col("sample_type") == "HKCategoryTypeIdentifierSleepAnalysis",
+                F.lit("silver_sleep_stages"),
+            )
+            .otherwise(F.lit("unknown")),
+        )
+        .withColumn("reason", F.lit("no matching uuid in target"))
     )
