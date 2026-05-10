@@ -6,7 +6,8 @@ table (wearables_zerobus) and produces:
 1. Bronze Typed Layer — VARIANT → typed column extraction, append-only audit trail.
 2. CDC Views — Union typed records (INSERT) with matching deletes (DELETE).
 3. Silver Layer — AUTO CDC applied (SCD Type 1 + SCD Type 2 for demo).
-4. Quarantine — Unmatched deletes captured for observability.
+4. Gold Layer — Session-level aggregations from stage-level silver data.
+5. Quarantine — Unmatched deletes captured for observability.
 
 Delta best practices applied:
 - Change Data Feed enabled (downstream incremental processing)
@@ -551,7 +552,7 @@ dp.create_auto_cdc_flow(
     keys=["uuid"],
     sequence_by=F.col("ingested_at"),
     apply_as_deletes=F.expr("operation = 'DELETE'"),
-    except_column_list=["operation", "record_id"],
+    except_column_list=["operation", "record_id", "metadata"],
     stored_as_scd_type=2,
 )
 
@@ -609,7 +610,7 @@ dp.create_auto_cdc_flow(
     keys=["uuid"],
     sequence_by=F.col("ingested_at"),
     apply_as_deletes=F.expr("operation = 'DELETE'"),
-    except_column_list=["operation", "record_id"],
+    except_column_list=["operation", "record_id", "metadata"],
     stored_as_scd_type=2,
 )
 
@@ -694,6 +695,83 @@ def silver_activity_summaries():
     return (
         spark.readStream.table("bronze_typed_activity_summaries")
         .drop("record_id")
+    )
+
+
+# #############################################################################
+#
+#   LAYER 4: GOLD (session-level aggregations)
+#
+#   Reconstructs sleep sessions from stage-level silver data.
+#   Reads from SCD1 tables (current state with deletes applied) so
+#   aggregations reflect the true current picture.
+#
+# #############################################################################
+
+
+# =============================================================================
+# gold_sleep_sessions — session-level sleep aggregation
+# =============================================================================
+
+
+@dp.materialized_view(
+    name="gold_sleep_sessions",
+    comment=(
+        "Sleep sessions reconstructed from stage-level silver data. "
+        "One row per user per session with per-stage duration breakdown, "
+        "stage counts, and sleep efficiency. Reads from silver_sleep_stages (SCD1) "
+        "so deleted stages are excluded from aggregations."
+    ),
+    table_properties={
+        "quality": "gold",
+        "delta.enableChangeDataFeed": "true",
+    },
+    cluster_by=["user_id", "sleep_date"],
+)
+def gold_sleep_sessions():
+    return (
+        spark.read.table("silver_sleep_stages")
+        .groupBy("user_id", "source_platform", "session_start_ts", "session_end_ts", "sleep_date")
+        .agg(
+            # Per-stage durations
+            F.sum(
+                F.when(F.col("stage") == "asleepDeep", F.col("stage_duration_minutes"))
+            ).alias("deep_sleep_minutes"),
+            F.sum(
+                F.when(F.col("stage") == "asleepREM", F.col("stage_duration_minutes"))
+            ).alias("rem_sleep_minutes"),
+            F.sum(
+                F.when(F.col("stage") == "asleepCore", F.col("stage_duration_minutes"))
+            ).alias("core_sleep_minutes"),
+            F.sum(
+                F.when(F.col("stage") == "awake", F.col("stage_duration_minutes"))
+            ).alias("awake_minutes"),
+            # Totals
+            F.sum("stage_duration_minutes").alias("total_tracked_minutes"),
+            F.count("*").alias("stage_count"),
+            # Per-stage counts
+            F.count(F.when(F.col("stage") == "asleepDeep", True)).alias("deep_stage_count"),
+            F.count(F.when(F.col("stage") == "asleepREM", True)).alias("rem_stage_count"),
+            F.count(F.when(F.col("stage") == "asleepCore", True)).alias("core_stage_count"),
+            F.count(F.when(F.col("stage") == "awake", True)).alias("awake_stage_count"),
+        )
+        .withColumn(
+            "session_duration_minutes",
+            (F.col("session_end_ts").cast("long") - F.col("session_start_ts").cast("long")) / 60.0,
+        )
+        .withColumn(
+            "total_sleep_minutes",
+            F.coalesce(F.col("deep_sleep_minutes"), F.lit(0))
+            + F.coalesce(F.col("rem_sleep_minutes"), F.lit(0))
+            + F.coalesce(F.col("core_sleep_minutes"), F.lit(0)),
+        )
+        .withColumn(
+            "sleep_efficiency",
+            F.when(
+                F.col("session_duration_minutes") > 0,
+                F.col("total_sleep_minutes") / F.col("session_duration_minutes"),
+            ),
+        )
     )
 
 
