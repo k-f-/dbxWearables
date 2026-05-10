@@ -1,15 +1,25 @@
-# Spark Declarative Pipeline — Silver HealthKit Layer
+# Spark Declarative Pipeline — HealthKit (Bronze Typed → Silver → Gold)
 #
-# Continuous-mode pipeline that reads from the ZeroBus bronze streaming table
-# and produces typed, deduplicated silver streaming tables optimized for
-# downstream metric views and KPI computation.
+# Continuous-mode pipeline that reads from the ZeroBus raw bronze streaming table
+# and produces typed structured tables, CDC-applied silver tables, and gold
+# aggregations for downstream metric views and KPI computation.
 #
-# Silver tables produced:
-#   - silver_health_samples     (HR, steps, SpO2, HRV, energy)
-#   - silver_workouts           (workout sessions)
-#   - silver_sleep_sessions     (sleep with stage durations)
-#   - silver_activity_summaries (daily rings + goal attainment)
-#   - silver_deletes            (deletion records for SCD)
+# Bronze Typed tables (append-only audit trail):
+#   - bronze_typed_health_samples  (HR, steps, SpO2, HRV, energy)
+#   - bronze_typed_workouts        (workout sessions)
+#   - bronze_typed_sleep_stages    (exploded per-stage, CDC key: stage_uuid)
+#   - bronze_typed_activity_summaries (daily rings + goal attainment)
+#   - bronze_typed_deletes         (deletion events for CDC)
+#
+# Silver tables (Phase 2/3 — AUTO CDC applied):
+#   - silver_health_samples / silver_health_samples_history (SCD1 + SCD2)
+#   - silver_workouts / silver_workouts_history (SCD1 + SCD2)
+#   - silver_sleep_stages / silver_sleep_stages_history (SCD1 + SCD2)
+#   - silver_activity_summaries (passthrough, no deletes)
+#   - quarantine_unmatched_deletes (observability)
+#
+# Gold tables (Phase 4):
+#   - gold_sleep_sessions (session-level aggregation from non-deleted stages)
 #
 # Mode: Continuous — processes new bronze records as they arrive.
 # Compute: Serverless (Photon-enabled).
@@ -17,7 +27,7 @@
 resources:
   pipelines:
     silver_healthkit:
-      name: "[${bundle.target}] Silver HealthKit"
+      name: "[${bundle.target}] HealthKit Pipeline"
 
       catalog: ${var.catalog}
       target: ${var.schema}

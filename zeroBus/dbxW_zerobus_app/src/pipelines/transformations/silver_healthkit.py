@@ -1,23 +1,23 @@
-"""Silver Layer — HealthKit Streaming Pipeline.
+"""Bronze Typed Layer — HealthKit Streaming Pipeline.
 
-Continuous-mode Spark Declarative Pipeline that reads from the ZeroBus bronze
-table (wearables_zerobus) and produces typed, deduplicated silver streaming
-tables optimized for metric views and KPI computation.
+Continuous-mode Spark Declarative Pipeline that reads from the ZeroBus raw bronze
+table (wearables_zerobus) and produces typed, structured streaming tables that
+serve as the append-only audit trail for downstream CDC processing.
+
+This layer performs VARIANT → typed column extraction only. No records are ever
+removed. Delete propagation happens at the silver layer via AUTO CDC.
 
 Delta best practices applied:
-- Change Data Feed enabled (downstream incremental processing)
+- Change Data Feed enabled (downstream CDC consumption)
 - Row Tracking enabled (row-level lineage)
 - Variant Shredding enabled (where VARIANT columns exist)
 - Liquid Clustering (per-user + time-series query patterns)
 - Data quality expectations (expect / expect_or_drop)
 
 Data Quality Strategy:
-- Hard drop (expect_or_drop): Null PKs, null required identifiers, useless rows
+- Hard drop (expect_or_drop): Null PKs, null UUIDs (row can't participate in CDC)
 - Soft warn (expect): Range checks, temporal consistency, completeness
 - Never used (expect_or_fail): Would halt continuous pipeline
-
-PK/FK RELY constraints and column comments are applied post-deploy
-via the src/ops/silver-healthkit-constraints notebook.
 """
 
 from pyspark import pipelines as dp
@@ -34,28 +34,28 @@ STAGES_ARRAY_TYPE = (
 
 
 # =============================================================================
-# silver_health_samples — typed health measurements
+# bronze_typed_health_samples — typed health measurements (audit trail)
 # =============================================================================
 
 
 @dp.table(
-    name="silver_health_samples",
+    name="bronze_typed_health_samples",
     comment=(
-        "Typed, deduplicated health samples from Apple HealthKit. "
+        "Typed health samples extracted from VARIANT bronze data. "
+        "Append-only audit trail — no deletes applied at this layer. "
         "Includes heart rate, step count, SpO2, HRV, respiratory rate, "
         "energy burned, flights climbed, and walking distance. "
-        "Clustered for per-user time-series queries and live dashboards "
-        "(e.g. brickster step counts)."
+        "CDC key: uuid."
     ),
     table_properties={
-        "quality": "silver",
+        "quality": "bronze",
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
         "delta.enableVariantShredding": "true",
     },
     cluster_by=["user_id", "sample_type", "sample_date"],
 )
-# ---- Hard drops (row is useless without these) ----
+# ---- Hard drops (row can't participate in CDC without these) ----
 @dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
 @dp.expect_or_drop("valid_uuid", "uuid IS NOT NULL")
 @dp.expect_or_drop("valid_value", "value IS NOT NULL")
@@ -86,7 +86,7 @@ STAGES_ARRAY_TYPE = (
     "reasonable_respiratory_rate",
     "sample_type != 'HKQuantityTypeIdentifierRespiratoryRate' OR (value BETWEEN 4 AND 60)",
 )
-def silver_health_samples():
+def bronze_typed_health_samples():
     return (
         spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "samples")
@@ -111,19 +111,20 @@ def silver_health_samples():
 
 
 # =============================================================================
-# silver_workouts — workout sessions
+# bronze_typed_workouts — typed workout sessions (audit trail)
 # =============================================================================
 
 
 @dp.table(
-    name="silver_workouts",
+    name="bronze_typed_workouts",
     comment=(
-        "Typed, deduplicated workout sessions from Apple HealthKit. "
+        "Typed workout sessions extracted from VARIANT bronze data. "
+        "Append-only audit trail — no deletes applied at this layer. "
         "Includes activity type, duration, distance, and energy burned. "
-        "Clustered for per-user activity analysis and weekly summaries."
+        "CDC key: uuid."
     ),
     table_properties={
-        "quality": "silver",
+        "quality": "bronze",
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
         "delta.enableVariantShredding": "true",
@@ -164,7 +165,7 @@ def silver_health_samples():
     "reasonable_timestamp",
     "start_ts >= '2020-01-01' AND start_ts <= current_timestamp()",
 )
-def silver_workouts():
+def bronze_typed_workouts():
     return (
         spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "workouts")
@@ -195,49 +196,52 @@ def silver_workouts():
 
 
 # =============================================================================
-# silver_sleep_sessions — sleep with stage durations
+# bronze_typed_sleep_stages — exploded sleep stages (one row per stage)
 # =============================================================================
 
 
 @dp.table(
-    name="silver_sleep_sessions",
+    name="bronze_typed_sleep_stages",
     comment=(
-        "Sleep sessions with per-stage duration breakdowns from Apple HealthKit. "
-        "Stages include awake, core, deep, and REM. "
-        "Clustered for per-user sleep quality trend analysis."
+        "Individual sleep stages exploded from session-level VARIANT data. "
+        "One row per stage (asleepDeep, asleepREM, asleepCore, awake). "
+        "Append-only audit trail — stage-level deletes applied at silver via AUTO CDC. "
+        "CDC key: stage_uuid. Session reconstruction happens at gold layer."
     ),
     table_properties={
-        "quality": "silver",
+        "quality": "bronze",
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
-        "delta.enableVariantShredding": "true",
     },
     cluster_by=["user_id", "sleep_date"],
 )
-# ---- Hard drops ----
+# ---- Hard drops (row can't participate in CDC without stage_uuid) ----
 @dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
+@dp.expect_or_drop("valid_stage_uuid", "stage_uuid IS NOT NULL")
 # ---- Soft expectations ----
 @dp.expect("valid_user", "user_id IS NOT NULL")
-@dp.expect("valid_timestamps", "start_ts IS NOT NULL AND end_ts IS NOT NULL")
-@dp.expect("chronological_timestamps", "start_ts < end_ts")
-@dp.expect("positive_duration", "total_duration_minutes > 0")
 @dp.expect(
-    "reasonable_sleep_duration", "total_duration_minutes BETWEEN 10 AND 1440"
+    "valid_stage_type",
+    "stage IN ('asleepDeep', 'asleepREM', 'asleepCore', 'awake')",
 )
-@dp.expect("non_negative_deep", "deep_sleep_minutes >= 0")
-@dp.expect("non_negative_rem", "rem_sleep_minutes >= 0")
-@dp.expect("non_negative_core", "core_sleep_minutes >= 0")
-@dp.expect("non_negative_awake", "awake_minutes >= 0")
 @dp.expect(
-    "stages_within_total",
-    "(deep_sleep_minutes + rem_sleep_minutes + core_sleep_minutes + awake_minutes) "
-    "<= total_duration_minutes * 1.1",
+    "valid_stage_timestamps",
+    "stage_start_ts IS NOT NULL AND stage_end_ts IS NOT NULL",
+)
+@dp.expect("chronological_stage", "stage_start_ts < stage_end_ts")
+@dp.expect("positive_duration", "stage_duration_minutes > 0")
+@dp.expect(
+    "reasonable_stage_duration", "stage_duration_minutes <= 720"
 )
 @dp.expect(
     "reasonable_timestamp",
-    "start_ts >= '2020-01-01' AND start_ts <= current_timestamp()",
+    "stage_start_ts >= '2020-01-01' AND stage_start_ts <= current_timestamp()",
 )
-def silver_sleep_sessions():
+@dp.expect(
+    "stage_within_session",
+    "stage_start_ts >= session_start_ts AND stage_end_ts <= session_end_ts",
+)
+def bronze_typed_sleep_stages():
     stages_cast = f"CAST(body:stages AS {STAGES_ARRAY_TYPE})"
     return (
         spark.readStream.table(BRONZE_TABLE)
@@ -247,78 +251,44 @@ def silver_sleep_sessions():
             F.col("ingested_at"),
             F.col("user_id"),
             F.col("source_platform"),
-            # Session timestamps
-            F.expr("body:start_date::timestamp").alias("start_ts"),
-            F.expr("body:end_date::timestamp").alias("end_ts"),
-            # Total duration in minutes
+            F.expr("body:start_date::timestamp").alias("session_start_ts"),
+            F.expr("body:end_date::timestamp").alias("session_end_ts"),
+            F.explode(F.expr(stages_cast)).alias("_stage"),
+        )
+        .select(
+            F.col("record_id"),
+            F.col("ingested_at"),
+            F.col("user_id"),
+            F.col("source_platform"),
+            F.col("_stage.uuid").alias("stage_uuid"),
+            F.col("_stage.stage").alias("stage"),
+            F.expr("CAST(_stage.start_date AS TIMESTAMP)").alias("stage_start_ts"),
+            F.expr("CAST(_stage.end_date AS TIMESTAMP)").alias("stage_end_ts"),
             F.expr(
-                "(CAST(body:end_date::timestamp AS LONG) "
-                "- CAST(body:start_date::timestamp AS LONG)) / 60.0"
-            ).alias("total_duration_minutes"),
-            # Stage durations via SQL aggregate on typed array
-            F.expr(f"""
-                aggregate(
-                    filter({stages_cast}, s -> s.stage = 'asleepDeep'),
-                    CAST(0.0 AS DOUBLE),
-                    (acc, s) -> acc + (
-                        CAST(CAST(s.end_date AS TIMESTAMP) AS LONG)
-                        - CAST(CAST(s.start_date AS TIMESTAMP) AS LONG)
-                    ) / 60.0
-                )
-            """).alias("deep_sleep_minutes"),
-            F.expr(f"""
-                aggregate(
-                    filter({stages_cast}, s -> s.stage = 'asleepREM'),
-                    CAST(0.0 AS DOUBLE),
-                    (acc, s) -> acc + (
-                        CAST(CAST(s.end_date AS TIMESTAMP) AS LONG)
-                        - CAST(CAST(s.start_date AS TIMESTAMP) AS LONG)
-                    ) / 60.0
-                )
-            """).alias("rem_sleep_minutes"),
-            F.expr(f"""
-                aggregate(
-                    filter({stages_cast}, s -> s.stage = 'asleepCore'),
-                    CAST(0.0 AS DOUBLE),
-                    (acc, s) -> acc + (
-                        CAST(CAST(s.end_date AS TIMESTAMP) AS LONG)
-                        - CAST(CAST(s.start_date AS TIMESTAMP) AS LONG)
-                    ) / 60.0
-                )
-            """).alias("core_sleep_minutes"),
-            F.expr(f"""
-                aggregate(
-                    filter({stages_cast}, s -> s.stage = 'awake'),
-                    CAST(0.0 AS DOUBLE),
-                    (acc, s) -> acc + (
-                        CAST(CAST(s.end_date AS TIMESTAMP) AS LONG)
-                        - CAST(CAST(s.start_date AS TIMESTAMP) AS LONG)
-                    ) / 60.0
-                )
-            """).alias("awake_minutes"),
-            # Stages array preserved for detailed analysis (typed)
-            F.expr(f"{stages_cast}").alias("stages"),
-            # Derived columns for metric views
-            F.to_date(F.expr("body:start_date::timestamp")).alias("sleep_date"),
-            F.expr(f"size({stages_cast})").alias("num_stages"),
+                "(CAST(CAST(_stage.end_date AS TIMESTAMP) AS LONG) "
+                "- CAST(CAST(_stage.start_date AS TIMESTAMP) AS LONG)) / 60.0"
+            ).alias("stage_duration_minutes"),
+            F.col("session_start_ts"),
+            F.col("session_end_ts"),
+            F.to_date(F.col("session_start_ts")).alias("sleep_date"),
         )
     )
 
 
 # =============================================================================
-# silver_activity_summaries — daily rings with goal attainment
+# bronze_typed_activity_summaries — daily rings (audit trail)
 # =============================================================================
 
 
 @dp.table(
-    name="silver_activity_summaries",
+    name="bronze_typed_activity_summaries",
     comment=(
         "Daily Apple Watch activity ring data with goal attainment percentages. "
-        "One row per user per day. Supports ring closure rate metrics "
-        "and weekly/monthly goal adherence KPIs."
+        "One row per user per day. Append-only — no deletes exist for this type. "
+        "Passes through to silver unchanged (no CDC needed)."
     ),
     table_properties={
-        "quality": "silver",
+        "quality": "bronze",
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
     },
@@ -348,7 +318,7 @@ def silver_sleep_sessions():
     "AND exercise_goal_pct IS NOT NULL AND NOT isnan(exercise_goal_pct) "
     "AND stand_goal_pct IS NOT NULL AND NOT isnan(stand_goal_pct)",
 )
-def silver_activity_summaries():
+def bronze_typed_activity_summaries():
     return (
         spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "activity_summaries")
@@ -387,19 +357,20 @@ def silver_activity_summaries():
 
 
 # =============================================================================
-# silver_deletes — deletion records for downstream SCD
+# bronze_typed_deletes — deletion event records (audit trail)
 # =============================================================================
 
 
 @dp.table(
-    name="silver_deletes",
+    name="bronze_typed_deletes",
     comment=(
-        "HealthKit deletion records for downstream soft-delete propagation. "
-        "Each row represents a sample UUID that was deleted on the source device. "
-        "Join to silver_health_samples.uuid for SCD Type 2 handling."
+        "HealthKit deletion event records. Each row is a delete event targeting "
+        "a specific UUID + sample_type. Used by CDC views to feed AUTO CDC at silver. "
+        "sample_type determines target table: HKQuantityType* → health_samples, "
+        "HKWorkoutTypeIdentifier → workouts, HKCategoryTypeIdentifierSleepAnalysis → sleep_stages."
     ),
     table_properties={
-        "quality": "silver",
+        "quality": "bronze",
         "delta.enableChangeDataFeed": "true",
         "delta.enableRowTracking": "true",
     },
@@ -416,7 +387,7 @@ def silver_activity_summaries():
     "uuid_format",
     "length(deleted_uuid) = 36 AND deleted_uuid RLIKE '^[0-9A-Fa-f-]{36}$'",
 )
-def silver_deletes():
+def bronze_typed_deletes():
     return (
         spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "deletes")
