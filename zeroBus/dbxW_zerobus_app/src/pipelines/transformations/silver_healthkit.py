@@ -20,18 +20,9 @@ PK/FK RELY constraints and column comments are applied post-deploy
 via the src/ops/silver-healthkit-constraints notebook.
 """
 
-import dlt
+from pyspark import pipelines as dp
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType,
-    StructField,
-    StringType,
-    DoubleType,
-    TimestampType,
-    IntegerType,
-    LongType,
-    ArrayType,
-)
+
 
 # Bronze source table — read from pipeline configuration (set in resource YAML)
 BRONZE_TABLE = spark.conf.get("bronze_table")
@@ -47,7 +38,7 @@ STAGES_ARRAY_TYPE = (
 # =============================================================================
 
 
-@dlt.table(
+@dp.table(
     name="silver_health_samples",
     comment=(
         "Typed, deduplicated health samples from Apple HealthKit. "
@@ -65,39 +56,39 @@ STAGES_ARRAY_TYPE = (
     cluster_by=["user_id", "sample_type", "sample_date"],
 )
 # ---- Hard drops (row is useless without these) ----
-@dlt.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
-@dlt.expect_or_drop("valid_uuid", "uuid IS NOT NULL")
-@dlt.expect_or_drop("valid_value", "value IS NOT NULL")
+@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
+@dp.expect_or_drop("valid_uuid", "uuid IS NOT NULL")
+@dp.expect_or_drop("valid_value", "value IS NOT NULL")
 # ---- Soft expectations (tracked, row preserved) ----
-@dlt.expect("valid_user", "user_id IS NOT NULL")
-@dlt.expect("valid_timestamps", "start_ts IS NOT NULL AND end_ts IS NOT NULL")
-@dlt.expect("chronological_timestamps", "start_ts <= end_ts")
-@dlt.expect("valid_unit", "unit IS NOT NULL AND unit != ''")
-@dlt.expect("known_sample_type", "sample_type LIKE 'HK%'")
-@dlt.expect("non_negative_value", "value >= 0")
-@dlt.expect(
+@dp.expect("valid_user", "user_id IS NOT NULL")
+@dp.expect("valid_timestamps", "start_ts IS NOT NULL AND end_ts IS NOT NULL")
+@dp.expect("chronological_timestamps", "start_ts <= end_ts")
+@dp.expect("valid_unit", "unit IS NOT NULL AND unit != ''")
+@dp.expect("known_sample_type", "sample_type LIKE 'HK%'")
+@dp.expect("non_negative_value", "value >= 0")
+@dp.expect(
     "reasonable_timestamp",
     "start_ts >= '2020-01-01' AND start_ts <= current_timestamp()",
 )
-@dlt.expect(
+@dp.expect(
     "reasonable_heart_rate",
     "sample_type != 'HKQuantityTypeIdentifierHeartRate' OR (value BETWEEN 20 AND 300)",
 )
-@dlt.expect(
+@dp.expect(
     "reasonable_spo2",
     "sample_type != 'HKQuantityTypeIdentifierOxygenSaturation' OR (value BETWEEN 50 AND 100)",
 )
-@dlt.expect(
+@dp.expect(
     "reasonable_hrv",
     "sample_type != 'HKQuantityTypeIdentifierHeartRateVariabilitySDNN' OR (value BETWEEN 0 AND 300)",
 )
-@dlt.expect(
+@dp.expect(
     "reasonable_respiratory_rate",
     "sample_type != 'HKQuantityTypeIdentifierRespiratoryRate' OR (value BETWEEN 4 AND 60)",
 )
 def silver_health_samples():
     return (
-        dlt.readStream(BRONZE_TABLE)
+        spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "samples")
         .select(
             F.col("record_id"),
@@ -124,7 +115,7 @@ def silver_health_samples():
 # =============================================================================
 
 
-@dlt.table(
+@dp.table(
     name="silver_workouts",
     comment=(
         "Typed, deduplicated workout sessions from Apple HealthKit. "
@@ -140,42 +131,42 @@ def silver_health_samples():
     cluster_by=["user_id", "activity_type", "workout_date"],
 )
 # ---- Hard drops ----
-@dlt.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
-@dlt.expect_or_drop("valid_uuid", "uuid IS NOT NULL")
+@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
+@dp.expect_or_drop("valid_uuid", "uuid IS NOT NULL")
 # ---- Soft expectations ----
-@dlt.expect("valid_user", "user_id IS NOT NULL")
-@dlt.expect("valid_duration", "duration_seconds > 0")
-@dlt.expect(
+@dp.expect("valid_user", "user_id IS NOT NULL")
+@dp.expect("valid_duration", "duration_seconds > 0")
+@dp.expect(
     "valid_activity_type", "activity_type IS NOT NULL AND activity_type != ''"
 )
-@dlt.expect(
+@dp.expect(
     "chronological_timestamps",
     "start_ts IS NOT NULL AND end_ts IS NOT NULL AND start_ts <= end_ts",
 )
-@dlt.expect("reasonable_duration", "duration_seconds < 86400")
-@dlt.expect(
+@dp.expect("reasonable_duration", "duration_seconds < 86400")
+@dp.expect(
     "non_negative_distance",
     "total_distance_meters IS NULL OR total_distance_meters >= 0",
 )
-@dlt.expect(
+@dp.expect(
     "non_negative_energy",
     "total_energy_burned_kcal IS NULL OR total_energy_burned_kcal >= 0",
 )
-@dlt.expect(
+@dp.expect(
     "reasonable_distance",
     "total_distance_meters IS NULL OR total_distance_meters < 500000",
 )
-@dlt.expect(
+@dp.expect(
     "reasonable_energy",
     "total_energy_burned_kcal IS NULL OR total_energy_burned_kcal < 10000",
 )
-@dlt.expect(
+@dp.expect(
     "reasonable_timestamp",
     "start_ts >= '2020-01-01' AND start_ts <= current_timestamp()",
 )
 def silver_workouts():
     return (
-        dlt.readStream(BRONZE_TABLE)
+        spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "workouts")
         .select(
             F.col("record_id"),
@@ -208,7 +199,7 @@ def silver_workouts():
 # =============================================================================
 
 
-@dlt.table(
+@dp.table(
     name="silver_sleep_sessions",
     comment=(
         "Sleep sessions with per-stage duration breakdowns from Apple HealthKit. "
@@ -224,32 +215,32 @@ def silver_workouts():
     cluster_by=["user_id", "sleep_date"],
 )
 # ---- Hard drops ----
-@dlt.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
+@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
 # ---- Soft expectations ----
-@dlt.expect("valid_user", "user_id IS NOT NULL")
-@dlt.expect("valid_timestamps", "start_ts IS NOT NULL AND end_ts IS NOT NULL")
-@dlt.expect("chronological_timestamps", "start_ts < end_ts")
-@dlt.expect("positive_duration", "total_duration_minutes > 0")
-@dlt.expect(
+@dp.expect("valid_user", "user_id IS NOT NULL")
+@dp.expect("valid_timestamps", "start_ts IS NOT NULL AND end_ts IS NOT NULL")
+@dp.expect("chronological_timestamps", "start_ts < end_ts")
+@dp.expect("positive_duration", "total_duration_minutes > 0")
+@dp.expect(
     "reasonable_sleep_duration", "total_duration_minutes BETWEEN 10 AND 1440"
 )
-@dlt.expect("non_negative_deep", "deep_sleep_minutes >= 0")
-@dlt.expect("non_negative_rem", "rem_sleep_minutes >= 0")
-@dlt.expect("non_negative_core", "core_sleep_minutes >= 0")
-@dlt.expect("non_negative_awake", "awake_minutes >= 0")
-@dlt.expect(
+@dp.expect("non_negative_deep", "deep_sleep_minutes >= 0")
+@dp.expect("non_negative_rem", "rem_sleep_minutes >= 0")
+@dp.expect("non_negative_core", "core_sleep_minutes >= 0")
+@dp.expect("non_negative_awake", "awake_minutes >= 0")
+@dp.expect(
     "stages_within_total",
     "(deep_sleep_minutes + rem_sleep_minutes + core_sleep_minutes + awake_minutes) "
     "<= total_duration_minutes * 1.1",
 )
-@dlt.expect(
+@dp.expect(
     "reasonable_timestamp",
     "start_ts >= '2020-01-01' AND start_ts <= current_timestamp()",
 )
 def silver_sleep_sessions():
     stages_cast = f"CAST(body:stages AS {STAGES_ARRAY_TYPE})"
     return (
-        dlt.readStream(BRONZE_TABLE)
+        spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "sleep")
         .select(
             F.col("record_id"),
@@ -319,7 +310,7 @@ def silver_sleep_sessions():
 # =============================================================================
 
 
-@dlt.table(
+@dp.table(
     name="silver_activity_summaries",
     comment=(
         "Daily Apple Watch activity ring data with goal attainment percentages. "
@@ -334,24 +325,24 @@ def silver_sleep_sessions():
     cluster_by=["user_id", "activity_date"],
 )
 # ---- Hard drops ----
-@dlt.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
+@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
 # ---- Soft expectations ----
-@dlt.expect("valid_user", "user_id IS NOT NULL")
-@dlt.expect("valid_date", "activity_date IS NOT NULL")
-@dlt.expect("valid_energy_goal", "energy_goal_kcal > 0")
-@dlt.expect("valid_exercise_goal", "exercise_goal_minutes > 0")
-@dlt.expect("valid_stand_goal", "stand_goal_hours > 0")
-@dlt.expect("non_negative_energy", "energy_burned_kcal >= 0")
-@dlt.expect(
+@dp.expect("valid_user", "user_id IS NOT NULL")
+@dp.expect("valid_date", "activity_date IS NOT NULL")
+@dp.expect("valid_energy_goal", "energy_goal_kcal > 0")
+@dp.expect("valid_exercise_goal", "exercise_goal_minutes > 0")
+@dp.expect("valid_stand_goal", "stand_goal_hours > 0")
+@dp.expect("non_negative_energy", "energy_burned_kcal >= 0")
+@dp.expect(
     "reasonable_exercise", "exercise_minutes >= 0 AND exercise_minutes <= 1440"
 )
-@dlt.expect("reasonable_stand", "stand_hours >= 0 AND stand_hours <= 24")
-@dlt.expect("reasonable_energy_burned", "energy_burned_kcal < 10000")
-@dlt.expect(
+@dp.expect("reasonable_stand", "stand_hours >= 0 AND stand_hours <= 24")
+@dp.expect("reasonable_energy_burned", "energy_burned_kcal < 10000")
+@dp.expect(
     "reasonable_date",
     "activity_date >= '2020-01-01' AND activity_date <= current_date()",
 )
-@dlt.expect(
+@dp.expect(
     "goal_attainment_finite",
     "energy_goal_pct IS NOT NULL AND NOT isnan(energy_goal_pct) "
     "AND exercise_goal_pct IS NOT NULL AND NOT isnan(exercise_goal_pct) "
@@ -359,7 +350,7 @@ def silver_sleep_sessions():
 )
 def silver_activity_summaries():
     return (
-        dlt.readStream(BRONZE_TABLE)
+        spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "activity_summaries")
         .select(
             F.col("record_id"),
@@ -400,7 +391,7 @@ def silver_activity_summaries():
 # =============================================================================
 
 
-@dlt.table(
+@dp.table(
     name="silver_deletes",
     comment=(
         "HealthKit deletion records for downstream soft-delete propagation. "
@@ -415,19 +406,19 @@ def silver_activity_summaries():
     cluster_by=["sample_type", "deleted_uuid"],
 )
 # ---- Hard drops ----
-@dlt.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
-@dlt.expect_or_drop("valid_uuid", "deleted_uuid IS NOT NULL")
+@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
+@dp.expect_or_drop("valid_uuid", "deleted_uuid IS NOT NULL")
 # ---- Soft expectations ----
-@dlt.expect("valid_user", "user_id IS NOT NULL")
-@dlt.expect("valid_sample_type", "sample_type IS NOT NULL AND sample_type != ''")
-@dlt.expect("known_sample_type", "sample_type LIKE 'HK%'")
-@dlt.expect(
+@dp.expect("valid_user", "user_id IS NOT NULL")
+@dp.expect("valid_sample_type", "sample_type IS NOT NULL AND sample_type != ''")
+@dp.expect("known_sample_type", "sample_type LIKE 'HK%'")
+@dp.expect(
     "uuid_format",
     "length(deleted_uuid) = 36 AND deleted_uuid RLIKE '^[0-9A-Fa-f-]{36}$'",
 )
 def silver_deletes():
     return (
-        dlt.readStream(BRONZE_TABLE)
+        spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "deletes")
         .select(
             F.col("record_id"),
