@@ -2,9 +2,9 @@
 
 ## Overview
 
-A three-layer Spark Declarative Pipeline that processes raw VARIANT-encoded HealthKit data from the ZeroBus bronze table into typed, delete-aware silver tables with full SCD history.
+A four-layer Spark Declarative Pipeline that processes raw VARIANT-encoded HealthKit data from the ZeroBus bronze table into typed, delete-aware silver tables with full SCD history, and session-level gold aggregations.
 
-**Pipeline**: `[dev] Silver HealthKit` (continuous, serverless, Photon)
+**Pipeline**: `[dev] HealthKit Pipeline` (continuous, serverless, Photon)
 **Source**: `hls_fde_dev.dev_matthew_giglia_wearables.wearables_zerobus`
 **Target schema**: `hls_fde_dev.dev_matthew_giglia_wearables`
 
@@ -33,7 +33,7 @@ wearables_zerobus (raw bronze — VARIANT, append-only)
 │  │                                                                         │
 │  └─────────────────────────────────────────────────────────────────────────┘
 │
-│  ┌─── SILVER (apply_changes — deletes physically applied) ────────────────┐
+│  ┌─── SILVER (AUTO CDC — deletes physically applied) ───────────────────┐
 │  │                                                                         │
 ├──►  silver_health_samples          (SCD Type 1 — current state only)
 ├──►  silver_health_samples_history  (SCD Type 2 — full change history)
@@ -45,16 +45,16 @@ wearables_zerobus (raw bronze — VARIANT, append-only)
 │  │                                                                         │
 │  └─────────────────────────────────────────────────────────────────────────┘
 │
-│  ┌─── QUARANTINE ─────────────────────────────────────────────────────────┐
+│  ┌─── GOLD (aggregations & metric views) ─────────────────────────────────┐
 │  │                                                                         │
-├──►  quarantine_unmatched_deletes   (deletes with no matching record)
+├──►  gold_sleep_sessions            (session-level agg from silver stages)
+├──►  (future metric views)
 │  │                                                                         │
 │  └─────────────────────────────────────────────────────────────────────────┘
 │
-│  ┌─── GOLD (aggregations & metric views) ─────────────────────────────────┐
+│  ┌─── QUARANTINE ─────────────────────────────────────────────────────────┐
 │  │                                                                         │
-├──►  gold_sleep_sessions            (re-aggregated from non-deleted stages)
-├──►  (future metric views)
+├──►  quarantine_unmatched_deletes   (deletes with no matching record)
 │  │                                                                         │
 │  └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -78,13 +78,13 @@ erDiagram
     bronze_typed_deletes }o--|| bronze_typed_sleep_stages : "deleted_uuid = stage_uuid (HKCategoryType*)"
     bronze_typed_deletes ||--o{ quarantine_unmatched_deletes : "no matching uuid found"
 
-    %% === SILVER (apply_changes output) ===
-    bronze_typed_health_samples ||--|| silver_health_samples : "apply_changes SCD1"
-    bronze_typed_health_samples ||--|| silver_health_samples_history : "apply_changes SCD2"
-    bronze_typed_workouts ||--|| silver_workouts : "apply_changes SCD1"
-    bronze_typed_workouts ||--|| silver_workouts_history : "apply_changes SCD2"
-    bronze_typed_sleep_stages ||--|| silver_sleep_stages : "apply_changes SCD1"
-    bronze_typed_sleep_stages ||--|| silver_sleep_stages_history : "apply_changes SCD2"
+    %% === SILVER (AUTO CDC output) ===
+    bronze_typed_health_samples ||--|| silver_health_samples : "AUTO CDC SCD1"
+    bronze_typed_health_samples ||--|| silver_health_samples_history : "AUTO CDC SCD2"
+    bronze_typed_workouts ||--|| silver_workouts : "AUTO CDC SCD1"
+    bronze_typed_workouts ||--|| silver_workouts_history : "AUTO CDC SCD2"
+    bronze_typed_sleep_stages ||--|| silver_sleep_stages : "AUTO CDC SCD1"
+    bronze_typed_sleep_stages ||--|| silver_sleep_stages_history : "AUTO CDC SCD2"
     bronze_typed_activity_summaries ||--|| silver_activity_summaries : "passthrough (no deletes)"
 
     %% === GOLD (aggregation) ===
@@ -215,12 +215,15 @@ erDiagram
         double total_distance_meters
         double total_energy_burned_kcal
         date workout_date
+        double duration_minutes
+        double distance_km
     }
 
     silver_workouts_history {
         string uuid "SCD2 — versioned"
         string user_id
         string activity_type
+        double duration_seconds
         timestamp __START_AT
         timestamp __END_AT
         boolean __IS_DELETED
@@ -272,15 +275,23 @@ erDiagram
 
     gold_sleep_sessions {
         string user_id
-        date sleep_date
-        timestamp session_start_ts
+        string source_platform
+        timestamp session_start_ts PK "Session boundary from HealthKit"
         timestamp session_end_ts
-        double total_duration_minutes
+        date sleep_date
         double deep_sleep_minutes
         double rem_sleep_minutes
         double core_sleep_minutes
         double awake_minutes
-        int num_stages
+        double total_tracked_minutes "Sum of all stage durations"
+        double total_sleep_minutes "deep + REM + core (excludes awake)"
+        double session_duration_minutes "Wall-clock: end_ts - start_ts"
+        double sleep_efficiency "total_sleep / session_duration"
+        int stage_count
+        int deep_stage_count
+        int rem_stage_count
+        int core_stage_count
+        int awake_stage_count
     }
 ```
 
@@ -302,7 +313,7 @@ These tables structure the raw VARIANT data into typed columns. They are **appen
 
 ### Layer 2: Silver (CDC-Applied, Delete-Aware)
 
-These tables are produced by `dlt.apply_changes()`. Each entity has **both** SCD Type 1 (current state, deletes physically removed) and SCD Type 2 (full history with `__START_AT`, `__END_AT`, `__IS_DELETED` columns).
+These tables are produced by `dp.create_auto_cdc_flow()`. Each entity has **both** SCD Type 1 (current state, deletes physically removed) and SCD Type 2 (full history with `__START_AT`, `__END_AT`, `__IS_DELETED` columns).
 
 | Table | SCD Type | CDC Key | Sequence By | Delete Condition |
 | --- | --- | --- | --- | --- |
@@ -316,9 +327,24 @@ These tables are produced by `dlt.apply_changes()`. Each entity has **both** SCD
 
 ### Layer 3: Gold (Aggregations)
 
-| Table | Type | Source | Grain |
-| --- | --- | --- | --- |
-| `gold_sleep_sessions` | Materialized View | `silver_sleep_stages` | One row per user per sleep session |
+| Table | Type | Source | Grain | Cluster Keys |
+| --- | --- | --- | --- | --- |
+| `gold_sleep_sessions` | Materialized View | `silver_sleep_stages` | One row per user per sleep session | user_id, sleep_date |
+
+**`gold_sleep_sessions` columns:**
+
+| Column | Description |
+| --- | --- |
+| `deep_sleep_minutes` | Total deep sleep duration in session |
+| `rem_sleep_minutes` | Total REM duration |
+| `core_sleep_minutes` | Total core/light sleep |
+| `awake_minutes` | Total awake time within session window |
+| `total_tracked_minutes` | Sum of all stage durations (deep + REM + core + awake) |
+| `total_sleep_minutes` | deep + REM + core (excludes awake) |
+| `session_duration_minutes` | Wall-clock time: `session_end_ts - session_start_ts` |
+| `sleep_efficiency` | `total_sleep_minutes / session_duration_minutes` |
+| `stage_count` | Total number of stages in session |
+| `{deep,rem,core,awake}_stage_count` | Per-type stage counts |
 
 ### Quarantine
 
@@ -346,14 +372,14 @@ The `sample_type` field in delete records determines which table the delete targ
 Each CDC view unions INSERT operations (from the bronze typed table) with DELETE operations (from bronze_typed_deletes), creating a unified change feed:
 
 ```python
-@dlt.view(name="cdc_health_samples_v")
+@dp.view(name="cdc_health_samples_v")
 def cdc_health_samples_v():
     inserts = (
-        dlt.readStream("bronze_typed_health_samples")
+        spark.readStream.table("bronze_typed_health_samples")
         .withColumn("operation", F.lit("INSERT"))
     )
     deletes = (
-        dlt.readStream("bronze_typed_deletes")
+        spark.readStream.table("bronze_typed_deletes")
         .filter(F.col("sample_type").startswith("HKQuantityType"))
         .select(
             F.col("deleted_uuid").alias("uuid"),
@@ -364,61 +390,59 @@ def cdc_health_samples_v():
     return inserts.unionByName(deletes, allowMissingColumns=True)
 ```
 
-### apply_changes Pattern (SCD1 + SCD2)
+### AUTO CDC Pattern (SCD1 + SCD2)
 
 ```python
 # SCD Type 1 — current state, deletes physically remove rows
-dlt.create_streaming_table("silver_health_samples",
+dp.create_streaming_table("silver_health_samples",
     cluster_by=["user_id", "sample_type", "sample_date"])
 
-dlt.apply_changes(
+dp.create_auto_cdc_flow(
     target="silver_health_samples",
     source="cdc_health_samples_v",
     keys=["uuid"],
     sequence_by=F.col("ingested_at"),
     apply_as_deletes=F.expr("operation = 'DELETE'"),
+    except_column_list=["operation", "record_id"],
     stored_as_scd_type=1,
 )
 
 # SCD Type 2 — full history with __START_AT, __END_AT, __IS_DELETED
-dlt.create_streaming_table("silver_health_samples_history",
+dp.create_streaming_table("silver_health_samples_history",
     cluster_by=["user_id", "sample_type", "sample_date"])
 
-dlt.apply_changes(
+dp.create_auto_cdc_flow(
     target="silver_health_samples_history",
     source="cdc_health_samples_v",
     keys=["uuid"],
     sequence_by=F.col("ingested_at"),
     apply_as_deletes=F.expr("operation = 'DELETE'"),
+    except_column_list=["operation", "record_id", "metadata"],
     stored_as_scd_type=2,
 )
 ```
+
+**Note:** SCD2 flows must exclude VARIANT columns (e.g. `metadata`) from change tracking because the `<=>` (null-safe equality) operator doesn't support VARIANT in window functions.
 
 ### Quarantine Pattern
 
 Unmatched deletes are captured via a LEFT ANTI JOIN materialized view:
 
 ```python
-@dlt.table(name="quarantine_unmatched_deletes")
+@dp.materialized_view(name="quarantine_unmatched_deletes")
 def quarantine_unmatched_deletes():
-    deletes = dlt.read("bronze_typed_deletes")
-    samples = dlt.read("bronze_typed_health_samples").select("uuid")
-    workouts = dlt.read("bronze_typed_workouts").select("uuid")
-    stages = dlt.read("bronze_typed_sleep_stages").select(
-        F.col("stage_uuid").alias("uuid")
-    )
+    deletes = spark.read.table("bronze_typed_deletes")
+    samples = spark.read.table("bronze_typed_health_samples").select(
+        F.col("uuid").alias("existing_uuid"))
+    workouts = spark.read.table("bronze_typed_workouts").select(
+        F.col("uuid").alias("existing_uuid"))
+    stages = spark.read.table("bronze_typed_sleep_stages").select(
+        F.col("stage_uuid").alias("existing_uuid"))
     all_uuids = samples.union(workouts).union(stages)
-    
+
     return (
-        deletes
-        .join(all_uuids, deletes.deleted_uuid == all_uuids.uuid, "left_anti")
-        .withColumn("target_table", F.when(
-            F.col("sample_type").startswith("HKQuantityType"), "silver_health_samples"
-        ).when(
-            F.col("sample_type") == "HKWorkoutTypeIdentifier", "silver_workouts"
-        ).when(
-            F.col("sample_type") == "HKCategoryTypeIdentifierSleepAnalysis", "silver_sleep_stages"
-        ).otherwise("unknown"))
+        deletes.join(all_uuids, deletes.deleted_uuid == all_uuids.existing_uuid, "left_anti")
+        .withColumn("target_table", ...)
         .withColumn("reason", F.lit("no matching uuid in target"))
     )
 ```
@@ -434,7 +458,8 @@ def quarantine_unmatched_deletes():
 | Sample deletes matched | 3,069 / 665,115 (0.46%) |
 | Workout deletes matched | 57 / 70 (81%) |
 | Sleep stage deletes matched | 1,651 / 2,406 (69%) |
-| Expected quarantine rows | ~663,000 (mostly historical sample orphans) |
+| Quarantine rows | ~1,401,900 (mostly historical sample orphans) |
+| Gold sleep sessions | 430,134 |
 
 The low match rate for samples is expected — Apple HealthKit's anchored query returns **all historical deletion events** on first sync, including records that were deleted on-device before ever being synced to Databricks.
 
@@ -446,26 +471,45 @@ The low match rate for samples is expected — Apple HealthKit's anchored query 
 
 Apple HealthKit stores sleep data as individual `HKCategoryTypeIdentifierSleepAnalysis` category samples — one per stage (deep, REM, core, awake). The iOS app groups these into "sessions" for convenience, but **HealthKit deletes target individual stages by UUID**, not sessions.
 
-To apply deletes via `apply_changes`, the bronze typed layer must store one row per stage with its UUID as the CDC key.
+To apply deletes via AUTO CDC, the bronze typed layer must store one row per stage with its UUID as the CDC key.
 
 ### Gold Aggregation (Session Reconstruction)
 
-```sql
--- gold_sleep_sessions: re-aggregate non-deleted stages into sessions
-SELECT
-    user_id,
-    sleep_date,
-    MIN(stage_start_ts) AS session_start_ts,
-    MAX(stage_end_ts) AS session_end_ts,
-    SUM(stage_duration_minutes) AS total_duration_minutes,
-    SUM(CASE WHEN stage = 'asleepDeep' THEN stage_duration_minutes ELSE 0 END) AS deep_sleep_minutes,
-    SUM(CASE WHEN stage = 'asleepREM' THEN stage_duration_minutes ELSE 0 END) AS rem_sleep_minutes,
-    SUM(CASE WHEN stage = 'asleepCore' THEN stage_duration_minutes ELSE 0 END) AS core_sleep_minutes,
-    SUM(CASE WHEN stage = 'awake' THEN stage_duration_minutes ELSE 0 END) AS awake_minutes,
-    COUNT(*) AS num_stages
-FROM silver_sleep_stages
-GROUP BY user_id, sleep_date
+The `gold_sleep_sessions` materialized view reads from `silver_sleep_stages` (SCD1 — deletes already applied) and groups by session boundaries:
+
+```python
+@dp.materialized_view(name="gold_sleep_sessions",
+    cluster_by=["user_id", "sleep_date"])
+def gold_sleep_sessions():
+    return (
+        spark.read.table("silver_sleep_stages")
+        .groupBy("user_id", "source_platform", "session_start_ts", "session_end_ts", "sleep_date")
+        .agg(
+            F.sum(F.when(F.col("stage") == "asleepDeep", F.col("stage_duration_minutes"))).alias("deep_sleep_minutes"),
+            F.sum(F.when(F.col("stage") == "asleepREM", F.col("stage_duration_minutes"))).alias("rem_sleep_minutes"),
+            F.sum(F.when(F.col("stage") == "asleepCore", F.col("stage_duration_minutes"))).alias("core_sleep_minutes"),
+            F.sum(F.when(F.col("stage") == "awake", F.col("stage_duration_minutes"))).alias("awake_minutes"),
+            F.sum("stage_duration_minutes").alias("total_tracked_minutes"),
+            F.count("*").alias("stage_count"),
+            # Per-stage counts...
+        )
+        .withColumn("session_duration_minutes",
+            (F.col("session_end_ts").cast("long") - F.col("session_start_ts").cast("long")) / 60.0)
+        .withColumn("total_sleep_minutes",
+            F.coalesce(F.col("deep_sleep_minutes"), F.lit(0))
+            + F.coalesce(F.col("rem_sleep_minutes"), F.lit(0))
+            + F.coalesce(F.col("core_sleep_minutes"), F.lit(0)))
+        .withColumn("sleep_efficiency",
+            F.when(F.col("session_duration_minutes") > 0,
+                F.col("total_sleep_minutes") / F.col("session_duration_minutes")))
+    )
 ```
+
+**Key design choices:**
+- Groups by `session_start_ts` + `session_end_ts` (the original HealthKit session boundaries carried from bronze)
+- `total_sleep_minutes` excludes awake time (deep + REM + core only)
+- `sleep_efficiency` = actual sleep / session window (can exceed 1.0 if stages from multiple sources overlap)
+- Reads from SCD1 table so deleted stages are excluded from aggregations
 
 ---
 
@@ -474,9 +518,9 @@ GROUP BY user_id, sleep_date
 | Layer | Approach | Rationale |
 | --- | --- | --- |
 | Bronze Typed | `expect` / `expect_or_drop` | Validate structure during VARIANT extraction. Drop rows with null PKs/UUIDs. |
-| Silver (CDC) | Inherits from bronze typed | `apply_changes` operates on pre-validated data. Duplicate deletes are idempotent. |
+| Silver (CDC) | Inherits from bronze typed | AUTO CDC operates on pre-validated data. Duplicate deletes are idempotent. |
+| Gold | Materialized view | Aggregation from clean silver data. Session boundaries from source. |
 | Quarantine | Reporting only | Captures orphan deletes for observability. No expectations needed. |
-| Gold | `expect` on aggregates | Sanity checks (e.g., session duration > 0, stage sum ≤ total). |
 
 ---
 
@@ -496,35 +540,26 @@ GROUP BY user_id, sleep_date
 ## Key Design Decisions
 
 1. **Bronze typed = audit trail**: Append-only, never mutated. Full lineage back to raw VARIANT via `record_id`.
-2. **Stage grain for sleep**: Enables per-stage `apply_changes` since HealthKit deletes target individual stages.
-3. **Both SCD1 and SCD2**: Demo versatility — SCD1 for dashboards/queries, SCD2 for temporal analysis and showing DLT capabilities.
+2. **Stage grain for sleep**: Enables per-stage AUTO CDC since HealthKit deletes target individual stages.
+3. **Both SCD1 and SCD2**: Demo versatility — SCD1 for dashboards/queries, SCD2 for temporal analysis.
 4. **Quarantine for unmatched deletes**: Dev data has 99%+ orphan deletes (historical). Production would surface sync issues.
 5. **Activity summaries bypass CDC**: Apple doesn't allow deletion of daily ring data. Simple streaming passthrough.
 6. **`ingested_at` as sequence key**: Monotonically increasing server timestamp ensures correct ordering of INSERT vs DELETE operations.
 7. **Continuous mode**: Near-real-time processing as bronze data arrives from ZeroBus.
+8. **VARIANT excluded from SCD2**: `<=>` operator doesn't support VARIANT in window functions — `metadata` added to `except_column_list`.
+9. **Gold reads SCD1**: Session aggregation uses the current-state table so deleted stages don't inflate metrics.
 
 ---
 
-## Implementation Plan
+## Implementation Status
 
-### Phase 1: Rename & Restructure Bronze Typed Layer
-- Rename current `silver_*` tables to `bronze_typed_*`
-- Change `silver_sleep_sessions` to `bronze_typed_sleep_stages` (explode stages, one row per stage with `stage_uuid`)
-- Adjust expectations and cluster keys accordingly
+All phases are complete and running in continuous mode.
 
-### Phase 2: CDC Views
-- Create `cdc_health_samples_v`, `cdc_workouts_v`, `cdc_sleep_stages_v`
-- Each view unions typed records (INSERT) with matching deletes (DELETE)
-
-### Phase 3: Silver apply_changes
-- `dlt.create_streaming_table()` for each SCD1 and SCD2 target
-- `dlt.apply_changes()` with appropriate keys, sequence, and delete conditions
-
-### Phase 4: Quarantine & Gold
-- Quarantine materialized view (LEFT ANTI JOIN unmatched deletes)
-- `gold_sleep_sessions` materialized view (stage → session aggregation)
-
-### Phase 5: Constraints & Documentation
-- PK/FK RELY constraints on silver tables
-- Column comments
-- Updated README (this file)
+| Phase | Status | Description |
+| --- | --- | --- |
+| 1. Bronze Typed Layer | ✅ Complete | Rename & restructure, explode sleep stages |
+| 2. CDC Views | ✅ Complete | Union typed records + deletes, tag operation |
+| 3. Silver AUTO CDC | ✅ Complete | SCD1 + SCD2 for all entities |
+| 4. Gold Aggregation | ✅ Complete | `gold_sleep_sessions` materialized view (430K sessions) |
+| 5. Quarantine | ✅ Complete | LEFT ANTI JOIN unmatched deletes (1.4M rows) |
+| 6. Constraints & Comments | ⬜ Not started | PK/FK RELY constraints, column comments |
