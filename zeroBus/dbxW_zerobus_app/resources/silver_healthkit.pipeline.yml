@@ -23,8 +23,10 @@ resources:
       target: ${var.schema}
 
       libraries:
-        - notebook:
-            path: ../src/pipelines/silver_healthkit.ipynb
+        - file:
+            path: ../src/pipelines/transformations/silver_healthkit.py
+
+      root_path: ../src/pipelines
 
       serverless: true
       continuous: true
