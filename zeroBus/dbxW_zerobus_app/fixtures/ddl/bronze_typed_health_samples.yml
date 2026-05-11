@@ -1,0 +1,133 @@
+# bronze_typed_health_samples — DDL fixture
+# Typed health measurements extracted from VARIANT bronze data.
+# This file drives table creation in the SDP pipeline via the config loader.
+
+table:
+  name: bronze_typed_health_samples
+  layer: bronze
+  type: streaming_table
+  comment: >
+    Typed health samples extracted from VARIANT bronze data.
+    Append-only audit trail — no deletes applied at this layer.
+    Includes heart rate, step count, SpO2, HRV, respiratory rate,
+    energy burned, flights climbed, and walking distance.
+    CDC key: uuid.
+  properties:
+    quality: bronze
+    delta.enableChangeDataFeed: "true"
+    delta.enableRowTracking: "true"
+    delta.enableVariantShredding: "true"
+  cluster_by:
+    - user_id
+    - sample_type
+    - sample_date
+
+columns:
+  - name: record_id
+    type: STRING
+    nullable: false
+    comment: "Bronze record GUID — 1:1 with source ingestion row"
+
+  - name: ingested_at
+    type: TIMESTAMP
+    nullable: false
+    comment: "Server-side ingestion timestamp from ZeroBus (AUTO CDC sequence key)"
+
+  - name: user_id
+    type: STRING
+    nullable: true
+    comment: "Authenticated user ID from JWT claims (joins to auth.users)"
+
+  - name: source_platform
+    type: STRING
+    nullable: true
+    comment: "Data source platform (apple_healthkit, synthetic, etc.)"
+
+  - name: uuid
+    type: STRING
+    nullable: false
+    comment: "HealthKit sample UUID — CDC dedup key for silver layer"
+
+  - name: sample_type
+    type: STRING
+    nullable: true
+    comment: "HKQuantityTypeIdentifier (e.g. HeartRate, StepCount, OxygenSaturation)"
+
+  - name: value
+    type: DOUBLE
+    nullable: false
+    comment: "Measured numeric value in the units specified by the unit column"
+
+  - name: unit
+    type: STRING
+    nullable: true
+    comment: "Unit of measurement (count/min, count, kcal, percent, ms, m, etc.)"
+
+  - name: start_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Sample measurement start timestamp (UTC)"
+
+  - name: end_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Sample measurement end timestamp (UTC)"
+
+  - name: source_name
+    type: STRING
+    nullable: true
+    comment: "Device or app that produced the sample (e.g. Apple Watch)"
+
+  - name: source_bundle_id
+    type: STRING
+    nullable: true
+    comment: "Bundle identifier of the source app"
+
+  - name: metadata
+    type: VARIANT
+    nullable: true
+    comment: "Optional HealthKit metadata dictionary (VARIANT, shredded)"
+
+  - name: sample_date
+    type: DATE
+    nullable: true
+    comment: "Date extracted from start_ts for liquid clustering"
+
+  - name: sample_hour
+    type: INT
+    nullable: true
+    comment: "Hour-of-day (0-23) for intraday pattern analysis"
+
+constraints:
+  primary_key:
+    name: bronze_typed_health_samples_pk
+    columns:
+      - record_id
+  foreign_keys:
+    - name: bronze_typed_health_samples_bronze_fk
+      columns:
+        - record_id
+      references:
+        table: wearables_zerobus
+        columns:
+          - record_id
+
+expectations:
+  # Hard drops — row cannot participate in CDC without these
+  drop:
+    valid_record_id: "record_id IS NOT NULL"
+    valid_uuid: "uuid IS NOT NULL"
+    valid_value: "value IS NOT NULL"
+  # Soft expectations — tracked in quality metrics, row preserved
+  warn:
+    valid_user: "user_id IS NOT NULL"
+    valid_timestamps: "start_ts IS NOT NULL AND end_ts IS NOT NULL"
+    chronological_timestamps: "start_ts <= end_ts"
+    valid_unit: "unit IS NOT NULL AND unit != ''"
+    known_sample_type: "sample_type LIKE 'HK%'"
+    non_negative_value: "value >= 0"
+    reasonable_timestamp: "start_ts >= '2020-01-01' AND start_ts <= current_timestamp()"
+    reasonable_heart_rate: "sample_type != 'HKQuantityTypeIdentifierHeartRate' OR (value BETWEEN 20 AND 300)"
+    reasonable_spo2: "sample_type != 'HKQuantityTypeIdentifierOxygenSaturation' OR (value BETWEEN 50 AND 100)"
+    reasonable_hrv: "sample_type != 'HKQuantityTypeIdentifierHeartRateVariabilitySDNN' OR (value BETWEEN 0 AND 300)"
+    reasonable_respiratory_rate: "sample_type != 'HKQuantityTypeIdentifierRespiratoryRate' OR (value BETWEEN 4 AND 60)"

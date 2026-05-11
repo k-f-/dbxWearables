@@ -393,9 +393,16 @@ def cdc_health_samples_v():
 ### AUTO CDC Pattern (SCD1 + SCD2)
 
 ```python
-# SCD Type 1 — current state, deletes physically remove rows
-dp.create_streaming_table("silver_health_samples",
-    cluster_by=["user_id", "sample_type", "sample_date"])
+# SCD Type 1 — config-driven table definition with schema DDL
+_cfg = load_table_config("silver_health_samples")
+
+dp.create_streaming_table(
+    name="silver_health_samples",
+    comment=get_table_comment(_cfg),
+    schema=build_schema_ddl(_cfg),  # Column comments + PK constraint from YAML
+    table_properties=get_table_properties(_cfg),
+    cluster_by=get_cluster_by(_cfg),
+)
 
 dp.create_auto_cdc_flow(
     target="silver_health_samples",
@@ -448,6 +455,102 @@ def quarantine_unmatched_deletes():
 ```
 
 ---
+
+## Config-Driven Architecture (fixtures/ddl/)
+
+Table metadata — column comments, types, constraints, expectations — is defined in
+YAML fixture files and loaded at pipeline runtime by the `lib.table_config` module.
+
+### File Structure
+
+```
+fixtures/ddl/
+├── bronze_typed_health_samples.yml
+├── bronze_typed_workouts.yml
+├── bronze_typed_sleep_stages.yml
+├── bronze_typed_activity_summaries.yml
+├── bronze_typed_deletes.yml
+├── silver_health_samples.yml
+├── silver_workouts.yml
+├── silver_sleep_stages.yml
+├── silver_activity_summaries.yml
+└── gold_sleep_sessions.yml        (table comment + column docs only — MVs can't use schema DDL)
+```
+
+### YAML Schema (per file)
+
+```yaml
+table:
+  name: bronze_typed_health_samples
+  layer: bronze
+  type: streaming_table
+  comment: "..."
+  properties: { quality: bronze, delta.enableChangeDataFeed: "true", ... }
+  cluster_by: [user_id, sample_type, sample_date]
+
+columns:
+  - name: record_id
+    type: STRING
+    nullable: false
+    comment: "Bronze record GUID — 1:1 with source ingestion row"
+  # ...
+
+constraints:
+  primary_key:
+    name: bronze_typed_health_samples_pk
+    columns: [record_id]
+  foreign_keys:
+    - name: bronze_typed_health_samples_bronze_fk
+      columns: [record_id]
+      references: { table: wearables_zerobus, columns: [record_id] }
+
+expectations:
+  drop:   { valid_record_id: "record_id IS NOT NULL", valid_uuid: "uuid IS NOT NULL" }
+  warn:   { valid_user: "user_id IS NOT NULL", ... }
+```
+
+### How It Works
+
+```python
+from lib.table_config import load_table_config, build_schema_ddl, ...
+
+_cfg = load_table_config("bronze_typed_health_samples")
+
+dp.create_streaming_table(
+    name="bronze_typed_health_samples",
+    comment=get_table_comment(_cfg),
+    schema=build_schema_ddl(_cfg),           # Column comments + PK in DDL
+    table_properties=get_table_properties(_cfg),
+    cluster_by=get_cluster_by(_cfg),
+    expect_all_or_drop=get_expectations_drop(_cfg),
+    expect_all=get_expectations_warn(_cfg),
+)
+
+@dp.append_flow(target="bronze_typed_health_samples")
+def bronze_typed_health_samples_flow():
+    return spark.readStream.table(BRONZE_TABLE).filter(...).select(...)
+```
+
+### What Gets Applied
+
+| Metadata | Bronze Typed | Silver SCD1 | Silver SCD2 | Gold MV |
+| --- | --- | --- | --- | --- |
+| Table comment | ✅ YAML | ✅ YAML | ✅ Hard-coded | ✅ YAML |
+| Column comments | ✅ schema DDL | ✅ schema DDL | ❌ (no explicit schema) | ❌ (MV limitation) |
+| PK constraint | ✅ schema DDL | ✅ schema DDL | ❌ (no explicit schema) | ❌ (MV limitation) |
+| Expectations | ✅ expect_all dicts | ❌ (inherits from bronze) | ❌ | ❌ |
+| Table properties | ✅ YAML | ✅ YAML | ✅ Hard-coded | ✅ YAML |
+| Cluster by | ✅ YAML | ✅ YAML | ✅ Hard-coded | ✅ YAML |
+
+### Design Rationale
+
+- **Single source of truth**: Column documentation lives in YAML, not scattered across README + pipeline code
+- **Schema DDL at creation time**: Bypasses the platform restriction on ALTER TABLE for pipeline-managed tables
+- **Separation of concerns**: Transformation logic stays clean; DDL metadata is maintained independently
+- **SCD2 without schema**: AUTO CDC adds `__START_AT`, `__END_AT`, `__IS_DELETED` — declaring an explicit schema would conflict
+
+---
+
 
 ## Data Volumes (Dev Environment)
 
@@ -562,4 +665,4 @@ All phases are complete and running in continuous mode.
 | 3. Silver AUTO CDC | ✅ Complete | SCD1 + SCD2 for all entities |
 | 4. Gold Aggregation | ✅ Complete | `gold_sleep_sessions` materialized view (430K sessions) |
 | 5. Quarantine | ✅ Complete | LEFT ANTI JOIN unmatched deletes (1.4M rows) |
-| 6. Constraints & Comments | ⬜ Not started | PK/FK RELY constraints, column comments |
+| 6. Config-Driven DDL | ✅ Complete | YAML fixtures → schema DDL with column comments + PK constraints, applied at pipeline runtime |

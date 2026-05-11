@@ -1,0 +1,74 @@
+# bronze_typed_deletes — DDL fixture
+# HealthKit deletion event records.
+
+table:
+  name: bronze_typed_deletes
+  layer: bronze
+  type: streaming_table
+  comment: >
+    HealthKit deletion event records. Each row is a delete event targeting
+    a specific UUID + sample_type. Used by CDC views to feed AUTO CDC at silver.
+    sample_type determines target table: HKQuantityType* -> health_samples,
+    HKWorkoutTypeIdentifier -> workouts, HKCategoryTypeIdentifierSleepAnalysis -> sleep_stages.
+  properties:
+    quality: bronze
+    delta.enableChangeDataFeed: "true"
+    delta.enableRowTracking: "true"
+  cluster_by:
+    - sample_type
+    - deleted_uuid
+
+columns:
+  - name: record_id
+    type: STRING
+    nullable: false
+    comment: "Bronze record GUID — 1:1 with source ingestion row (PK)"
+
+  - name: ingested_at
+    type: TIMESTAMP
+    nullable: false
+    comment: "Server-side ingestion timestamp from ZeroBus"
+
+  - name: user_id
+    type: STRING
+    nullable: true
+    comment: "Authenticated user ID of the user who deleted the sample"
+
+  - name: source_platform
+    type: STRING
+    nullable: true
+    comment: "Data source platform identifier"
+
+  - name: deleted_uuid
+    type: STRING
+    nullable: false
+    comment: "UUID of the deleted HealthKit record (targets silver tables via CDC)"
+
+  - name: sample_type
+    type: STRING
+    nullable: true
+    comment: "HK type identifier — determines target table for delete routing"
+
+constraints:
+  primary_key:
+    name: bronze_typed_deletes_pk
+    columns:
+      - record_id
+  foreign_keys:
+    - name: bronze_typed_deletes_bronze_fk
+      columns:
+        - record_id
+      references:
+        table: wearables_zerobus
+        columns:
+          - record_id
+
+expectations:
+  drop:
+    valid_record_id: "record_id IS NOT NULL"
+    valid_uuid: "deleted_uuid IS NOT NULL"
+  warn:
+    valid_user: "user_id IS NOT NULL"
+    valid_sample_type: "sample_type IS NOT NULL AND sample_type != ''"
+    known_sample_type: "sample_type LIKE 'HK%'"
+    uuid_format: "length(deleted_uuid) = 36 AND deleted_uuid RLIKE '^[0-9A-Fa-f-]{36}$'"

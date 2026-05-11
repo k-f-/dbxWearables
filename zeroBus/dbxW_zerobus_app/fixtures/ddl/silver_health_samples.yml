@@ -1,0 +1,84 @@
+table:
+  name: silver_health_samples
+  layer: silver
+  type: streaming_table
+  scd_type: 1
+  comment: 'Current-state health samples with deletes physically applied (SCD Type
+    1). Records deleted on the source device are removed from this table. Optimized
+    for dashboards and metric views.
+
+    '
+  properties:
+    quality: silver
+    delta.enableChangeDataFeed: 'true'
+    delta.enableRowTracking: 'true'
+  cluster_by:
+  - user_id
+  - sample_type
+  - sample_date
+columns:
+- name: ingested_at
+  type: TIMESTAMP
+  nullable: true
+  comment: Server-side ingestion timestamp from ZeroBus (AUTO CDC sequence key)
+- name: user_id
+  type: STRING
+  nullable: true
+  comment: Authenticated user ID from JWT claims (joins to auth.users)
+- name: source_platform
+  type: STRING
+  nullable: true
+  comment: Data source platform (apple_healthkit, synthetic, etc.)
+- name: uuid
+  type: STRING
+  nullable: true
+  comment: HealthKit sample UUID — primary key, CDC dedup key
+- name: sample_type
+  type: STRING
+  nullable: true
+  comment: HKQuantityTypeIdentifier (e.g. HeartRate, StepCount, OxygenSaturation)
+- name: value
+  type: DOUBLE
+  nullable: true
+  comment: Measured numeric value in the units specified by the unit column
+- name: unit
+  type: STRING
+  nullable: true
+  comment: Unit of measurement (count/min, count, kcal, percent, ms, m, etc.)
+- name: start_ts
+  type: TIMESTAMP
+  nullable: true
+  comment: Sample measurement start timestamp (UTC)
+- name: end_ts
+  type: TIMESTAMP
+  nullable: true
+  comment: Sample measurement end timestamp (UTC)
+- name: source_name
+  type: STRING
+  nullable: true
+  comment: Device or app that produced the sample (e.g. Apple Watch)
+- name: source_bundle_id
+  type: STRING
+  nullable: true
+  comment: Bundle identifier of the source app
+- name: metadata
+  type: VARIANT
+  nullable: true
+  comment: Optional HealthKit metadata dictionary (VARIANT, shredded)
+- name: sample_date
+  type: DATE
+  nullable: true
+  comment: Date extracted from start_ts for liquid clustering
+- name: sample_hour
+  type: INT
+  nullable: true
+  comment: Hour-of-day (0-23) for intraday pattern analysis
+constraints:
+  primary_key:
+    name: silver_health_samples_pk
+    columns:
+    - uuid
+  foreign_keys: []
+expectations:
+  drop: {}
+  warn: {}

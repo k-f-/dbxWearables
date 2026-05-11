@@ -1,0 +1,137 @@
+# bronze_typed_workouts — DDL fixture
+# Typed workout sessions extracted from VARIANT bronze data.
+
+table:
+  name: bronze_typed_workouts
+  layer: bronze
+  type: streaming_table
+  comment: >
+    Typed workout sessions extracted from VARIANT bronze data.
+    Append-only audit trail — no deletes applied at this layer.
+    Includes activity type, duration, distance, and energy burned.
+    CDC key: uuid.
+  properties:
+    quality: bronze
+    delta.enableChangeDataFeed: "true"
+    delta.enableRowTracking: "true"
+    delta.enableVariantShredding: "true"
+  cluster_by:
+    - user_id
+    - activity_type
+    - workout_date
+
+columns:
+  - name: record_id
+    type: STRING
+    nullable: false
+    comment: "Bronze record GUID — 1:1 with source ingestion row"
+
+  - name: ingested_at
+    type: TIMESTAMP
+    nullable: false
+    comment: "Server-side ingestion timestamp from ZeroBus (AUTO CDC sequence key)"
+
+  - name: user_id
+    type: STRING
+    nullable: true
+    comment: "Authenticated user ID from JWT claims"
+
+  - name: source_platform
+    type: STRING
+    nullable: true
+    comment: "Data source platform identifier"
+
+  - name: uuid
+    type: STRING
+    nullable: false
+    comment: "HealthKit workout UUID — primary key, CDC dedup key"
+
+  - name: activity_type
+    type: STRING
+    nullable: true
+    comment: "Human-readable activity type (walking, cycling, running, etc.)"
+
+  - name: activity_type_raw
+    type: INT
+    nullable: true
+    comment: "Apple HKWorkoutActivityType raw integer enum value"
+
+  - name: duration_seconds
+    type: DOUBLE
+    nullable: true
+    comment: "Total workout duration in seconds"
+
+  - name: start_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Workout start timestamp (UTC)"
+
+  - name: end_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Workout end timestamp (UTC)"
+
+  - name: total_distance_meters
+    type: DOUBLE
+    nullable: true
+    comment: "Total distance covered in meters (NULL if not applicable)"
+
+  - name: total_energy_burned_kcal
+    type: DOUBLE
+    nullable: true
+    comment: "Total active energy burned in kilocalories"
+
+  - name: source_name
+    type: STRING
+    nullable: true
+    comment: "Device that recorded the workout"
+
+  - name: metadata
+    type: VARIANT
+    nullable: true
+    comment: "Optional workout metadata dictionary (VARIANT)"
+
+  - name: workout_date
+    type: DATE
+    nullable: true
+    comment: "Date extracted from start_ts for liquid clustering"
+
+  - name: duration_minutes
+    type: DOUBLE
+    nullable: true
+    comment: "Derived: duration_seconds / 60"
+
+  - name: distance_km
+    type: DOUBLE
+    nullable: true
+    comment: "Derived: total_distance_meters / 1000"
+
+constraints:
+  primary_key:
+    name: bronze_typed_workouts_pk
+    columns:
+      - record_id
+  foreign_keys:
+    - name: bronze_typed_workouts_bronze_fk
+      columns:
+        - record_id
+      references:
+        table: wearables_zerobus
+        columns:
+          - record_id
+
+expectations:
+  drop:
+    valid_record_id: "record_id IS NOT NULL"
+    valid_uuid: "uuid IS NOT NULL"
+  warn:
+    valid_user: "user_id IS NOT NULL"
+    valid_duration: "duration_seconds > 0"
+    valid_activity_type: "activity_type IS NOT NULL AND activity_type != ''"
+    chronological_timestamps: "start_ts IS NOT NULL AND end_ts IS NOT NULL AND start_ts <= end_ts"
+    reasonable_duration: "duration_seconds < 86400"
+    non_negative_distance: "total_distance_meters IS NULL OR total_distance_meters >= 0"
+    non_negative_energy: "total_energy_burned_kcal IS NULL OR total_energy_burned_kcal >= 0"
+    reasonable_distance: "total_distance_meters IS NULL OR total_distance_meters < 500000"
+    reasonable_energy: "total_energy_burned_kcal IS NULL OR total_energy_burned_kcal < 10000"
+    reasonable_timestamp: "start_ts >= '2020-01-01' AND start_ts <= current_timestamp()"

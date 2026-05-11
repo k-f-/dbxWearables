@@ -42,7 +42,7 @@ resources:
       continuous: true
       development: true
       photon: true
-      channel: current
+      channel: preview
 
       configuration:
         # Source bronze table — used by pipeline code

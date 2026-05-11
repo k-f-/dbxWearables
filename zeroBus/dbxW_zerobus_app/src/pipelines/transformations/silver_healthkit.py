@@ -20,10 +20,28 @@ Data Quality Strategy:
 - Hard drop (expect_or_drop): Null PKs, null UUIDs (row can't participate in CDC)
 - Soft warn (expect): Range checks, temporal consistency, completeness
 - Never used (expect_or_fail): Would halt continuous pipeline
+
+Architecture Note:
+- Table metadata (comments, column comments, constraints, expectations) is defined
+  in YAML fixture files under fixtures/ddl/ and loaded at runtime by the config
+  loader (lib.table_config). This keeps DDL concerns separate from transformation
+  logic and enables single-source-of-truth documentation.
+- SCD2 history tables do NOT use explicit schemas — AUTO CDC adds __START_AT,
+  __END_AT, __IS_DELETED system columns automatically.
 """
 
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
+
+from lib.table_config import (
+    load_table_config,
+    build_schema_ddl,
+    get_table_comment,
+    get_table_properties,
+    get_cluster_by,
+    get_expectations_drop,
+    get_expectations_warn,
+)
 
 
 # Bronze source table — read from pipeline configuration (set in resource YAML)
@@ -39,6 +57,12 @@ STAGES_ARRAY_TYPE = (
 #
 #   LAYER 1: BRONZE TYPED (append-only audit trail)
 #
+#   All bronze typed tables use config-driven definitions:
+#   - Schema DDL (with column comments + PK constraints) from YAML
+#   - Expectations (drop + warn) from YAML
+#   - Table properties and cluster_by from YAML
+#   - Transformation logic in @dp.append_flow functions
+#
 # #############################################################################
 
 
@@ -46,56 +70,21 @@ STAGES_ARRAY_TYPE = (
 # bronze_typed_health_samples — typed health measurements (audit trail)
 # =============================================================================
 
+_cfg_health_samples = load_table_config("bronze_typed_health_samples")
 
-@dp.table(
+dp.create_streaming_table(
     name="bronze_typed_health_samples",
-    comment=(
-        "Typed health samples extracted from VARIANT bronze data. "
-        "Append-only audit trail — no deletes applied at this layer. "
-        "Includes heart rate, step count, SpO2, HRV, respiratory rate, "
-        "energy burned, flights climbed, and walking distance. "
-        "CDC key: uuid."
-    ),
-    table_properties={
-        "quality": "bronze",
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-        "delta.enableVariantShredding": "true",
-    },
-    cluster_by=["user_id", "sample_type", "sample_date"],
+    comment=get_table_comment(_cfg_health_samples),
+    schema=build_schema_ddl(_cfg_health_samples),
+    table_properties=get_table_properties(_cfg_health_samples),
+    cluster_by=get_cluster_by(_cfg_health_samples),
+    expect_all_or_drop=get_expectations_drop(_cfg_health_samples),
+    expect_all=get_expectations_warn(_cfg_health_samples),
 )
-# ---- Hard drops (row can't participate in CDC without these) ----
-@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
-@dp.expect_or_drop("valid_uuid", "uuid IS NOT NULL")
-@dp.expect_or_drop("valid_value", "value IS NOT NULL")
-# ---- Soft expectations (tracked, row preserved) ----
-@dp.expect("valid_user", "user_id IS NOT NULL")
-@dp.expect("valid_timestamps", "start_ts IS NOT NULL AND end_ts IS NOT NULL")
-@dp.expect("chronological_timestamps", "start_ts <= end_ts")
-@dp.expect("valid_unit", "unit IS NOT NULL AND unit != ''")
-@dp.expect("known_sample_type", "sample_type LIKE 'HK%'")
-@dp.expect("non_negative_value", "value >= 0")
-@dp.expect(
-    "reasonable_timestamp",
-    "start_ts >= '2020-01-01' AND start_ts <= current_timestamp()",
-)
-@dp.expect(
-    "reasonable_heart_rate",
-    "sample_type != 'HKQuantityTypeIdentifierHeartRate' OR (value BETWEEN 20 AND 300)",
-)
-@dp.expect(
-    "reasonable_spo2",
-    "sample_type != 'HKQuantityTypeIdentifierOxygenSaturation' OR (value BETWEEN 50 AND 100)",
-)
-@dp.expect(
-    "reasonable_hrv",
-    "sample_type != 'HKQuantityTypeIdentifierHeartRateVariabilitySDNN' OR (value BETWEEN 0 AND 300)",
-)
-@dp.expect(
-    "reasonable_respiratory_rate",
-    "sample_type != 'HKQuantityTypeIdentifierRespiratoryRate' OR (value BETWEEN 4 AND 60)",
-)
-def bronze_typed_health_samples():
+
+
+@dp.append_flow(target="bronze_typed_health_samples")
+def bronze_typed_health_samples_flow():
     return (
         spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "samples")
@@ -123,58 +112,21 @@ def bronze_typed_health_samples():
 # bronze_typed_workouts — typed workout sessions (audit trail)
 # =============================================================================
 
+_cfg_workouts = load_table_config("bronze_typed_workouts")
 
-@dp.table(
+dp.create_streaming_table(
     name="bronze_typed_workouts",
-    comment=(
-        "Typed workout sessions extracted from VARIANT bronze data. "
-        "Append-only audit trail — no deletes applied at this layer. "
-        "Includes activity type, duration, distance, and energy burned. "
-        "CDC key: uuid."
-    ),
-    table_properties={
-        "quality": "bronze",
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-        "delta.enableVariantShredding": "true",
-    },
-    cluster_by=["user_id", "activity_type", "workout_date"],
+    comment=get_table_comment(_cfg_workouts),
+    schema=build_schema_ddl(_cfg_workouts),
+    table_properties=get_table_properties(_cfg_workouts),
+    cluster_by=get_cluster_by(_cfg_workouts),
+    expect_all_or_drop=get_expectations_drop(_cfg_workouts),
+    expect_all=get_expectations_warn(_cfg_workouts),
 )
-# ---- Hard drops ----
-@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
-@dp.expect_or_drop("valid_uuid", "uuid IS NOT NULL")
-# ---- Soft expectations ----
-@dp.expect("valid_user", "user_id IS NOT NULL")
-@dp.expect("valid_duration", "duration_seconds > 0")
-@dp.expect(
-    "valid_activity_type", "activity_type IS NOT NULL AND activity_type != ''"
-)
-@dp.expect(
-    "chronological_timestamps",
-    "start_ts IS NOT NULL AND end_ts IS NOT NULL AND start_ts <= end_ts",
-)
-@dp.expect("reasonable_duration", "duration_seconds < 86400")
-@dp.expect(
-    "non_negative_distance",
-    "total_distance_meters IS NULL OR total_distance_meters >= 0",
-)
-@dp.expect(
-    "non_negative_energy",
-    "total_energy_burned_kcal IS NULL OR total_energy_burned_kcal >= 0",
-)
-@dp.expect(
-    "reasonable_distance",
-    "total_distance_meters IS NULL OR total_distance_meters < 500000",
-)
-@dp.expect(
-    "reasonable_energy",
-    "total_energy_burned_kcal IS NULL OR total_energy_burned_kcal < 10000",
-)
-@dp.expect(
-    "reasonable_timestamp",
-    "start_ts >= '2020-01-01' AND start_ts <= current_timestamp()",
-)
-def bronze_typed_workouts():
+
+
+@dp.append_flow(target="bronze_typed_workouts")
+def bronze_typed_workouts_flow():
     return (
         spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "workouts")
@@ -208,49 +160,21 @@ def bronze_typed_workouts():
 # bronze_typed_sleep_stages — exploded sleep stages (one row per stage)
 # =============================================================================
 
+_cfg_sleep_stages = load_table_config("bronze_typed_sleep_stages")
 
-@dp.table(
+dp.create_streaming_table(
     name="bronze_typed_sleep_stages",
-    comment=(
-        "Individual sleep stages exploded from session-level VARIANT data. "
-        "One row per stage (asleepDeep, asleepREM, asleepCore, awake). "
-        "Append-only audit trail — stage-level deletes applied at silver via AUTO CDC. "
-        "CDC key: stage_uuid. Session reconstruction happens at gold layer."
-    ),
-    table_properties={
-        "quality": "bronze",
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-    },
-    cluster_by=["user_id", "sleep_date"],
+    comment=get_table_comment(_cfg_sleep_stages),
+    schema=build_schema_ddl(_cfg_sleep_stages),
+    table_properties=get_table_properties(_cfg_sleep_stages),
+    cluster_by=get_cluster_by(_cfg_sleep_stages),
+    expect_all_or_drop=get_expectations_drop(_cfg_sleep_stages),
+    expect_all=get_expectations_warn(_cfg_sleep_stages),
 )
-# ---- Hard drops (row can't participate in CDC without stage_uuid) ----
-@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
-@dp.expect_or_drop("valid_stage_uuid", "stage_uuid IS NOT NULL")
-# ---- Soft expectations ----
-@dp.expect("valid_user", "user_id IS NOT NULL")
-@dp.expect(
-    "valid_stage_type",
-    "stage IN ('asleepDeep', 'asleepREM', 'asleepCore', 'awake')",
-)
-@dp.expect(
-    "valid_stage_timestamps",
-    "stage_start_ts IS NOT NULL AND stage_end_ts IS NOT NULL",
-)
-@dp.expect("chronological_stage", "stage_start_ts < stage_end_ts")
-@dp.expect("positive_duration", "stage_duration_minutes > 0")
-@dp.expect(
-    "reasonable_stage_duration", "stage_duration_minutes <= 720"
-)
-@dp.expect(
-    "reasonable_timestamp",
-    "stage_start_ts >= '2020-01-01' AND stage_start_ts <= current_timestamp()",
-)
-@dp.expect(
-    "stage_within_session",
-    "stage_start_ts >= session_start_ts AND stage_end_ts <= session_end_ts",
-)
-def bronze_typed_sleep_stages():
+
+
+@dp.append_flow(target="bronze_typed_sleep_stages")
+def bronze_typed_sleep_stages_flow():
     stages_cast = f"CAST(body:stages AS {STAGES_ARRAY_TYPE})"
     return (
         spark.readStream.table(BRONZE_TABLE)
@@ -274,8 +198,8 @@ def bronze_typed_sleep_stages():
             F.expr("CAST(_stage.start_date AS TIMESTAMP)").alias("stage_start_ts"),
             F.expr("CAST(_stage.end_date AS TIMESTAMP)").alias("stage_end_ts"),
             F.expr(
-                "(CAST(CAST(_stage.end_date AS TIMESTAMP) AS LONG) "
-                "- CAST(CAST(_stage.start_date AS TIMESTAMP) AS LONG)) / 60.0"
+                "CAST((CAST(CAST(_stage.end_date AS TIMESTAMP) AS LONG) "
+                "- CAST(CAST(_stage.start_date AS TIMESTAMP) AS LONG)) / 60.0 AS DOUBLE)"
             ).alias("stage_duration_minutes"),
             F.col("session_start_ts"),
             F.col("session_end_ts"),
@@ -288,46 +212,21 @@ def bronze_typed_sleep_stages():
 # bronze_typed_activity_summaries — daily rings (audit trail)
 # =============================================================================
 
+_cfg_activity_summaries = load_table_config("bronze_typed_activity_summaries")
 
-@dp.table(
+dp.create_streaming_table(
     name="bronze_typed_activity_summaries",
-    comment=(
-        "Daily Apple Watch activity ring data with goal attainment percentages. "
-        "One row per user per day. Append-only — no deletes exist for this type. "
-        "Passes through to silver unchanged (no CDC needed)."
-    ),
-    table_properties={
-        "quality": "bronze",
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-    },
-    cluster_by=["user_id", "activity_date"],
+    comment=get_table_comment(_cfg_activity_summaries),
+    schema=build_schema_ddl(_cfg_activity_summaries),
+    table_properties=get_table_properties(_cfg_activity_summaries),
+    cluster_by=get_cluster_by(_cfg_activity_summaries),
+    expect_all_or_drop=get_expectations_drop(_cfg_activity_summaries),
+    expect_all=get_expectations_warn(_cfg_activity_summaries),
 )
-# ---- Hard drops ----
-@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
-# ---- Soft expectations ----
-@dp.expect("valid_user", "user_id IS NOT NULL")
-@dp.expect("valid_date", "activity_date IS NOT NULL")
-@dp.expect("valid_energy_goal", "energy_goal_kcal > 0")
-@dp.expect("valid_exercise_goal", "exercise_goal_minutes > 0")
-@dp.expect("valid_stand_goal", "stand_goal_hours > 0")
-@dp.expect("non_negative_energy", "energy_burned_kcal >= 0")
-@dp.expect(
-    "reasonable_exercise", "exercise_minutes >= 0 AND exercise_minutes <= 1440"
-)
-@dp.expect("reasonable_stand", "stand_hours >= 0 AND stand_hours <= 24")
-@dp.expect("reasonable_energy_burned", "energy_burned_kcal < 10000")
-@dp.expect(
-    "reasonable_date",
-    "activity_date >= '2020-01-01' AND activity_date <= current_date()",
-)
-@dp.expect(
-    "goal_attainment_finite",
-    "energy_goal_pct IS NOT NULL AND NOT isnan(energy_goal_pct) "
-    "AND exercise_goal_pct IS NOT NULL AND NOT isnan(exercise_goal_pct) "
-    "AND stand_goal_pct IS NOT NULL AND NOT isnan(stand_goal_pct)",
-)
-def bronze_typed_activity_summaries():
+
+
+@dp.append_flow(target="bronze_typed_activity_summaries")
+def bronze_typed_activity_summaries_flow():
     return (
         spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "activity_summaries")
@@ -369,34 +268,21 @@ def bronze_typed_activity_summaries():
 # bronze_typed_deletes — deletion event records (audit trail)
 # =============================================================================
 
+_cfg_deletes = load_table_config("bronze_typed_deletes")
 
-@dp.table(
+dp.create_streaming_table(
     name="bronze_typed_deletes",
-    comment=(
-        "HealthKit deletion event records. Each row is a delete event targeting "
-        "a specific UUID + sample_type. Used by CDC views to feed AUTO CDC at silver. "
-        "sample_type determines target table: HKQuantityType* -> health_samples, "
-        "HKWorkoutTypeIdentifier -> workouts, HKCategoryTypeIdentifierSleepAnalysis -> sleep_stages."
-    ),
-    table_properties={
-        "quality": "bronze",
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-    },
-    cluster_by=["sample_type", "deleted_uuid"],
+    comment=get_table_comment(_cfg_deletes),
+    schema=build_schema_ddl(_cfg_deletes),
+    table_properties=get_table_properties(_cfg_deletes),
+    cluster_by=get_cluster_by(_cfg_deletes),
+    expect_all_or_drop=get_expectations_drop(_cfg_deletes),
+    expect_all=get_expectations_warn(_cfg_deletes),
 )
-# ---- Hard drops ----
-@dp.expect_or_drop("valid_record_id", "record_id IS NOT NULL")
-@dp.expect_or_drop("valid_uuid", "deleted_uuid IS NOT NULL")
-# ---- Soft expectations ----
-@dp.expect("valid_user", "user_id IS NOT NULL")
-@dp.expect("valid_sample_type", "sample_type IS NOT NULL AND sample_type != ''")
-@dp.expect("known_sample_type", "sample_type LIKE 'HK%'")
-@dp.expect(
-    "uuid_format",
-    "length(deleted_uuid) = 36 AND deleted_uuid RLIKE '^[0-9A-Fa-f-]{36}$'",
-)
-def bronze_typed_deletes():
+
+
+@dp.append_flow(target="bronze_typed_deletes")
+def bronze_typed_deletes_flow():
     return (
         spark.readStream.table(BRONZE_TABLE)
         .filter(F.col("record_type") == "deletes")
@@ -488,11 +374,12 @@ def cdc_sleep_stages_v():
 #
 #   LAYER 3: SILVER (AUTO CDC applied — SCD Type 1 + Type 2)
 #
-#   Each entity gets two target tables:
-#   - SCD Type 1: current state only, deletes physically remove rows
-#   - SCD Type 2: full history with __START_AT, __END_AT, __IS_DELETED
+#   SCD1 tables use config-driven schema DDL (column comments + PK constraint).
+#   SCD2 history tables do NOT use explicit schemas — AUTO CDC adds system
+#   columns (__START_AT, __END_AT, __IS_DELETED) automatically.
 #
-#   Activity summaries have no deletes — simple streaming passthrough.
+#   Activity summaries have no deletes — simple streaming passthrough with
+#   config-driven schema.
 #
 # #############################################################################
 
@@ -501,19 +388,14 @@ def cdc_sleep_stages_v():
 # silver_health_samples — SCD Type 1 (current state, deletes applied)
 # =============================================================================
 
+_cfg_silver_health_samples = load_table_config("silver_health_samples")
+
 dp.create_streaming_table(
     name="silver_health_samples",
-    comment=(
-        "Current-state health samples with deletes physically applied (SCD Type 1). "
-        "Records deleted on the source device are removed from this table. "
-        "Optimized for dashboards and metric views."
-    ),
-    table_properties={
-        "quality": "silver",
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-    },
-    cluster_by=["user_id", "sample_type", "sample_date"],
+    comment=get_table_comment(_cfg_silver_health_samples),
+    schema=build_schema_ddl(_cfg_silver_health_samples),
+    table_properties=get_table_properties(_cfg_silver_health_samples),
+    cluster_by=get_cluster_by(_cfg_silver_health_samples),
 )
 
 dp.create_auto_cdc_flow(
@@ -529,6 +411,7 @@ dp.create_auto_cdc_flow(
 
 # =============================================================================
 # silver_health_samples_history — SCD Type 2 (full change history)
+# No explicit schema — AUTO CDC adds __START_AT, __END_AT, __IS_DELETED
 # =============================================================================
 
 dp.create_streaming_table(
@@ -561,18 +444,14 @@ dp.create_auto_cdc_flow(
 # silver_workouts — SCD Type 1 (current state, deletes applied)
 # =============================================================================
 
+_cfg_silver_workouts = load_table_config("silver_workouts")
+
 dp.create_streaming_table(
     name="silver_workouts",
-    comment=(
-        "Current-state workouts with deletes physically applied (SCD Type 1). "
-        "Deleted workouts are removed. Optimized for activity dashboards."
-    ),
-    table_properties={
-        "quality": "silver",
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-    },
-    cluster_by=["user_id", "activity_type", "workout_date"],
+    comment=get_table_comment(_cfg_silver_workouts),
+    schema=build_schema_ddl(_cfg_silver_workouts),
+    table_properties=get_table_properties(_cfg_silver_workouts),
+    cluster_by=get_cluster_by(_cfg_silver_workouts),
 )
 
 dp.create_auto_cdc_flow(
@@ -588,6 +467,7 @@ dp.create_auto_cdc_flow(
 
 # =============================================================================
 # silver_workouts_history — SCD Type 2 (full change history)
+# No explicit schema — AUTO CDC adds __START_AT, __END_AT, __IS_DELETED
 # =============================================================================
 
 dp.create_streaming_table(
@@ -619,18 +499,14 @@ dp.create_auto_cdc_flow(
 # silver_sleep_stages — SCD Type 1 (current state, deletes applied)
 # =============================================================================
 
+_cfg_silver_sleep_stages = load_table_config("silver_sleep_stages")
+
 dp.create_streaming_table(
     name="silver_sleep_stages",
-    comment=(
-        "Current-state sleep stages with deletes applied (SCD Type 1). "
-        "Deleted stages are removed. Use gold_sleep_sessions for session aggregation."
-    ),
-    table_properties={
-        "quality": "silver",
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-    },
-    cluster_by=["user_id", "sleep_date"],
+    comment=get_table_comment(_cfg_silver_sleep_stages),
+    schema=build_schema_ddl(_cfg_silver_sleep_stages),
+    table_properties=get_table_properties(_cfg_silver_sleep_stages),
+    cluster_by=get_cluster_by(_cfg_silver_sleep_stages),
 )
 
 dp.create_auto_cdc_flow(
@@ -646,6 +522,7 @@ dp.create_auto_cdc_flow(
 
 # =============================================================================
 # silver_sleep_stages_history — SCD Type 2 (full change history)
+# No explicit schema — AUTO CDC adds __START_AT, __END_AT, __IS_DELETED
 # =============================================================================
 
 dp.create_streaming_table(
@@ -677,21 +554,19 @@ dp.create_auto_cdc_flow(
 # silver_activity_summaries — streaming passthrough (no deletes exist)
 # =============================================================================
 
+_cfg_silver_activity_summaries = load_table_config("silver_activity_summaries")
 
-@dp.table(
+dp.create_streaming_table(
     name="silver_activity_summaries",
-    comment=(
-        "Activity summaries passed through from bronze (no deletes exist for this type). "
-        "One row per user per day with ring values and goal attainment."
-    ),
-    table_properties={
-        "quality": "silver",
-        "delta.enableChangeDataFeed": "true",
-        "delta.enableRowTracking": "true",
-    },
-    cluster_by=["user_id", "activity_date"],
+    comment=get_table_comment(_cfg_silver_activity_summaries),
+    schema=build_schema_ddl(_cfg_silver_activity_summaries),
+    table_properties=get_table_properties(_cfg_silver_activity_summaries),
+    cluster_by=get_cluster_by(_cfg_silver_activity_summaries),
 )
-def silver_activity_summaries():
+
+
+@dp.append_flow(target="silver_activity_summaries")
+def silver_activity_summaries_flow():
     return (
         spark.readStream.table("bronze_typed_activity_summaries")
         .drop("record_id")
@@ -706,6 +581,10 @@ def silver_activity_summaries():
 #   Reads from SCD1 tables (current state with deletes applied) so
 #   aggregations reflect the true current picture.
 #
+#   Note: Materialized views do not support explicit schema DDL —
+#   column comments cannot be applied via this mechanism. Table comment
+#   and properties are set directly.
+#
 # #############################################################################
 
 
@@ -713,20 +592,14 @@ def silver_activity_summaries():
 # gold_sleep_sessions — session-level sleep aggregation
 # =============================================================================
 
+_cfg_gold = load_table_config("gold_sleep_sessions")
+
 
 @dp.materialized_view(
     name="gold_sleep_sessions",
-    comment=(
-        "Sleep sessions reconstructed from stage-level silver data. "
-        "One row per user per session with per-stage duration breakdown, "
-        "stage counts, and sleep efficiency. Reads from silver_sleep_stages (SCD1) "
-        "so deleted stages are excluded from aggregations."
-    ),
-    table_properties={
-        "quality": "gold",
-        "delta.enableChangeDataFeed": "true",
-    },
-    cluster_by=["user_id", "sleep_date"],
+    comment=get_table_comment(_cfg_gold),
+    table_properties=get_table_properties(_cfg_gold),
+    cluster_by=get_cluster_by(_cfg_gold),
 )
 def gold_sleep_sessions():
     return (
