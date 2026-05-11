@@ -1,0 +1,59 @@
+# Spark Declarative Pipeline — HealthKit (Bronze Typed → Silver → Gold)
+#
+# Continuous-mode pipeline that reads from the ZeroBus raw bronze streaming table
+# and produces typed structured tables, CDC-applied silver tables, and gold
+# aggregations for downstream metric views and KPI computation.
+#
+# Bronze Typed tables (append-only audit trail):
+#   - bronze_typed_health_samples  (HR, steps, SpO2, HRV, energy)
+#   - bronze_typed_workouts        (workout sessions)
+#   - bronze_typed_sleep_stages    (exploded per-stage, CDC key: stage_uuid)
+#   - bronze_typed_activity_summaries (daily rings + goal attainment)
+#   - bronze_typed_deletes         (deletion events for CDC)
+#
+# Silver tables (Phase 2/3 — AUTO CDC applied):
+#   - silver_health_samples / silver_health_samples_history (SCD1 + SCD2)
+#   - silver_workouts / silver_workouts_history (SCD1 + SCD2)
+#   - silver_sleep_stages / silver_sleep_stages_history (SCD1 + SCD2)
+#   - silver_activity_summaries (passthrough, no deletes)
+#   - quarantine_unmatched_deletes (observability)
+#
+# Gold tables (Phase 4):
+#   - gold_sleep_sessions (session-level aggregation from non-deleted stages)
+#
+# Mode: Continuous — processes new bronze records as they arrive.
+# Compute: Serverless (Photon-enabled).
+#
+# Architecture:
+#   - silver_healthkit.py — Bronze typed + CDC views + Silver (Python, config-driven)
+#   - gold_and_quarantine.sql — Gold + Quarantine MVs (SQL, explicit column comments)
+
+resources:
+  pipelines:
+    silver_healthkit:
+      name: "[${bundle.target}] HealthKit Pipeline"
+
+      catalog: ${var.catalog}
+      target: ${var.schema}
+
+      libraries:
+        - file:
+            path: ../src/pipelines/transformations/silver_healthkit.py
+        - file:
+            path: ../src/pipelines/transformations/gold_and_quarantine.sql
+
+      root_path: ../src/pipelines
+
+      serverless: true
+      continuous: true
+      development: true
+      photon: true
+      channel: preview
+
+      configuration:
+        # Source bronze table — used by pipeline code
+        bronze_table: "${var.catalog}.${var.schema}.wearables_zerobus"
+
+      permissions:
+        - level: CAN_VIEW
+          group_name: "users"

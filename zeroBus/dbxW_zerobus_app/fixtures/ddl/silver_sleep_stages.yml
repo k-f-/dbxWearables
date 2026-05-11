@@ -1,0 +1,70 @@
+table:
+  name: silver_sleep_stages
+  layer: silver
+  type: streaming_table
+  scd_type: 1
+  comment: 'Current-state sleep stages with deletes applied (SCD Type 1). Deleted
+    stages are removed. Use gold_sleep_sessions for session aggregation.
+
+    '
+  properties:
+    quality: silver
+    delta.enableChangeDataFeed: 'true'
+    delta.enableRowTracking: 'true'
+  cluster_by:
+  - user_id
+  - sleep_date
+columns:
+- name: ingested_at
+  type: TIMESTAMP
+  nullable: true
+  comment: Server-side ingestion timestamp from ZeroBus (AUTO CDC sequence key)
+- name: user_id
+  type: STRING
+  nullable: true
+  comment: Authenticated user ID from JWT claims
+- name: source_platform
+  type: STRING
+  nullable: true
+  comment: Data source platform identifier
+- name: stage_uuid
+  type: STRING
+  nullable: true
+  comment: Per-stage HealthKit UUID — primary key, CDC dedup key (one per sleep stage)
+- name: stage
+  type: STRING
+  nullable: true
+  comment: 'Sleep stage type: asleepDeep, asleepREM, asleepCore, or awake'
+- name: stage_start_ts
+  type: TIMESTAMP
+  nullable: true
+  comment: Stage start timestamp (UTC)
+- name: stage_end_ts
+  type: TIMESTAMP
+  nullable: true
+  comment: Stage end timestamp (UTC)
+- name: stage_duration_minutes
+  type: DOUBLE
+  nullable: true
+  comment: 'Derived: (stage_end_ts - stage_start_ts) in minutes'
+- name: session_start_ts
+  type: TIMESTAMP
+  nullable: true
+  comment: Parent sleep session start (UTC, for grouping stages into sessions)
+- name: session_end_ts
+  type: TIMESTAMP
+  nullable: true
+  comment: Parent sleep session end (UTC)
+- name: sleep_date
+  type: DATE
+  nullable: true
+  comment: Date of session onset for liquid clustering and daily aggregation
+constraints:
+  primary_key:
+    name: silver_sleep_stages_pk
+    columns:
+    - stage_uuid
+  foreign_keys: []
+expectations:
+  drop: {}
+  warn: {}

@@ -1,0 +1,129 @@
+# gold_sleep_sessions — DDL fixture
+# Session-level sleep aggregation from stage-level silver data.
+#
+# IMPLEMENTATION NOTE:
+# This MV is defined in SQL (not Python) to enable column-level COMMENT clauses:
+#   src/pipelines/transformations/gold_and_quarantine.sql
+#
+# The SQL file uses CREATE MATERIALIZED VIEW with an explicit column list.
+# Column comments below are the canonical source — keep them in sync with
+# the SQL definition. The table comment, properties, and cluster_by are also
+# specified directly in the SQL DDL (not loaded via lib.table_config).
+
+table:
+  name: gold_sleep_sessions
+  layer: gold
+  type: materialized_view
+  implementation: sql  # gold_and_quarantine.sql (not Python config-driven)
+  comment: >
+    Sleep sessions reconstructed from stage-level silver data.
+    One row per user per session with per-stage duration breakdown,
+    stage counts, and sleep efficiency. Reads from silver_sleep_stages (SCD1)
+    so deleted stages are excluded from aggregations.
+  properties:
+    quality: gold
+    delta.enableChangeDataFeed: "true"
+  cluster_by:
+    - user_id
+    - sleep_date
+
+# Column comments are applied via the SQL DDL column list in
+# gold_and_quarantine.sql. This YAML is the canonical reference.
+columns:
+  - name: user_id
+    type: STRING
+    nullable: true
+    comment: "Authenticated user ID from JWT claims"
+
+  - name: source_platform
+    type: STRING
+    nullable: true
+    comment: "Data source platform identifier"
+
+  - name: session_start_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Sleep session start (UTC, from HealthKit session boundary)"
+
+  - name: session_end_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Sleep session end (UTC, from HealthKit session boundary)"
+
+  - name: sleep_date
+    type: DATE
+    nullable: true
+    comment: "Date of session onset for liquid clustering"
+
+  - name: deep_sleep_minutes
+    type: DOUBLE
+    nullable: true
+    comment: "Total minutes in deep (slow-wave) sleep stage"
+
+  - name: rem_sleep_minutes
+    type: DOUBLE
+    nullable: true
+    comment: "Total minutes in REM sleep stage"
+
+  - name: core_sleep_minutes
+    type: DOUBLE
+    nullable: true
+    comment: "Total minutes in core (light) sleep stage"
+
+  - name: awake_minutes
+    type: DOUBLE
+    nullable: true
+    comment: "Total minutes spent awake within session window"
+
+  - name: total_tracked_minutes
+    type: DOUBLE
+    nullable: true
+    comment: "Sum of all stage durations (deep + REM + core + awake)"
+
+  - name: stage_count
+    type: BIGINT
+    nullable: false
+    comment: "Total number of stages in session"
+
+  - name: deep_stage_count
+    type: BIGINT
+    nullable: false
+    comment: "Number of deep sleep stage transitions"
+
+  - name: rem_stage_count
+    type: BIGINT
+    nullable: false
+    comment: "Number of REM stage transitions"
+
+  - name: core_stage_count
+    type: BIGINT
+    nullable: false
+    comment: "Number of core sleep stage transitions"
+
+  - name: awake_stage_count
+    type: BIGINT
+    nullable: false
+    comment: "Number of awake stage transitions"
+
+  - name: session_duration_minutes
+    type: DOUBLE
+    nullable: true
+    comment: "Wall-clock time: session_end_ts - session_start_ts in minutes"
+
+  - name: total_sleep_minutes
+    type: DOUBLE
+    nullable: true
+    comment: "Derived: deep + REM + core (excludes awake)"
+
+  - name: sleep_efficiency
+    type: DOUBLE
+    nullable: true
+    comment: "Derived: total_sleep_minutes / session_duration_minutes"
+
+constraints:
+  primary_key: null  # No PK on materialized views
+  foreign_keys: []
+
+expectations:
+  drop: {}
+  warn: {}

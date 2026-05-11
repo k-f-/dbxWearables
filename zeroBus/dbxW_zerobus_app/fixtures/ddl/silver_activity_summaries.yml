@@ -1,0 +1,79 @@
+table:
+  name: silver_activity_summaries
+  layer: silver
+  type: streaming_table
+  scd_type: null
+  comment: 'Activity summaries passed through from bronze (no deletes exist for this
+    type). One row per user per day with ring values and goal attainment.
+
+    '
+  properties:
+    quality: silver
+    delta.enableChangeDataFeed: 'true'
+    delta.enableRowTracking: 'true'
+  cluster_by:
+  - user_id
+  - activity_date
+columns:
+- name: ingested_at
+  type: TIMESTAMP
+  nullable: true
+  comment: Server-side ingestion timestamp from ZeroBus
+- name: user_id
+  type: STRING
+  nullable: true
+  comment: Authenticated user ID from JWT claims
+- name: source_platform
+  type: STRING
+  nullable: true
+  comment: Data source platform identifier
+- name: activity_date
+  type: DATE
+  nullable: true
+  comment: Calendar date for the activity summary (one per user per day)
+- name: energy_burned_kcal
+  type: DOUBLE
+  nullable: true
+  comment: Active energy burned (Move ring value) in kilocalories
+- name: energy_goal_kcal
+  type: DOUBLE
+  nullable: true
+  comment: Daily Move ring goal in kilocalories
+- name: exercise_minutes
+  type: INT
+  nullable: true
+  comment: Exercise minutes logged (Exercise ring value)
+- name: exercise_goal_minutes
+  type: INT
+  nullable: true
+  comment: Daily Exercise ring goal in minutes
+- name: stand_hours
+  type: INT
+  nullable: true
+  comment: Stand hours completed (Stand ring value)
+- name: stand_goal_hours
+  type: INT
+  nullable: true
+  comment: Daily Stand ring goal in hours
+- name: energy_goal_pct
+  type: DOUBLE
+  nullable: true
+  comment: 'Derived: energy_burned / energy_goal (1.0 = Move ring closed)'
+- name: exercise_goal_pct
+  type: DOUBLE
+  nullable: true
+  comment: 'Derived: exercise_minutes / exercise_goal (1.0 = Exercise ring closed)'
+- name: stand_goal_pct
+  type: DOUBLE
+  nullable: true
+  comment: 'Derived: stand_hours / stand_goal (1.0 = Stand ring closed)'
+constraints:
+  primary_key:
+    name: silver_activity_summaries_pk
+    columns:
+    - user_id
+    - activity_date
+  foreign_keys: []
+expectations:
+  drop: {}
+  warn: {}

@@ -1,0 +1,91 @@
+table:
+  name: silver_workouts
+  layer: silver
+  type: streaming_table
+  scd_type: 1
+  comment: 'Current-state workouts with deletes physically applied (SCD Type 1). Deleted
+    workouts are removed. Optimized for activity dashboards.
+
+    '
+  properties:
+    quality: silver
+    delta.enableChangeDataFeed: 'true'
+    delta.enableRowTracking: 'true'
+  cluster_by:
+  - user_id
+  - activity_type
+  - workout_date
+columns:
+- name: ingested_at
+  type: TIMESTAMP
+  nullable: true
+  comment: Server-side ingestion timestamp from ZeroBus (AUTO CDC sequence key)
+- name: user_id
+  type: STRING
+  nullable: true
+  comment: Authenticated user ID from JWT claims
+- name: source_platform
+  type: STRING
+  nullable: true
+  comment: Data source platform identifier
+- name: uuid
+  type: STRING
+  nullable: true
+  comment: HealthKit workout UUID — primary key, CDC dedup key
+- name: activity_type
+  type: STRING
+  nullable: true
+  comment: Human-readable activity type (walking, cycling, running, etc.)
+- name: activity_type_raw
+  type: INT
+  nullable: true
+  comment: Apple HKWorkoutActivityType raw integer enum value
+- name: duration_seconds
+  type: DOUBLE
+  nullable: true
+  comment: Total workout duration in seconds
+- name: start_ts
+  type: TIMESTAMP
+  nullable: true
+  comment: Workout start timestamp (UTC)
+- name: end_ts
+  type: TIMESTAMP
+  nullable: true
+  comment: Workout end timestamp (UTC)
+- name: total_distance_meters
+  type: DOUBLE
+  nullable: true
+  comment: Total distance covered in meters (NULL if not applicable)
+- name: total_energy_burned_kcal
+  type: DOUBLE
+  nullable: true
+  comment: Total active energy burned in kilocalories
+- name: source_name
+  type: STRING
+  nullable: true
+  comment: Device that recorded the workout
+- name: metadata
+  type: VARIANT
+  nullable: true
+  comment: Optional workout metadata dictionary (VARIANT)
+- name: workout_date
+  type: DATE
+  nullable: true
+  comment: Date extracted from start_ts for liquid clustering
+- name: duration_minutes
+  type: DOUBLE
+  nullable: true
+  comment: 'Derived: duration_seconds / 60'
+- name: distance_km
+  type: DOUBLE
+  nullable: true
+  comment: 'Derived: total_distance_meters / 1000'
+constraints:
+  primary_key:
+    name: silver_workouts_pk
+    columns:
+    - uuid
+  foreign_keys: []
+expectations:
+  drop: {}
+  warn: {}

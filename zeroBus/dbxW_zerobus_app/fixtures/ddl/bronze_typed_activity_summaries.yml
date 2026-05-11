@@ -1,0 +1,122 @@
+# bronze_typed_activity_summaries — DDL fixture
+# Daily Apple Watch activity ring data with goal attainment percentages.
+
+table:
+  name: bronze_typed_activity_summaries
+  layer: bronze
+  type: streaming_table
+  comment: >
+    Daily Apple Watch activity ring data with goal attainment percentages.
+    One row per user per day. Append-only — no deletes exist for this type.
+    Passes through to silver unchanged (no CDC needed).
+  properties:
+    quality: bronze
+    delta.enableChangeDataFeed: "true"
+    delta.enableRowTracking: "true"
+  cluster_by:
+    - user_id
+    - activity_date
+
+columns:
+  - name: record_id
+    type: STRING
+    nullable: false
+    comment: "Bronze record GUID — 1:1 with source ingestion row"
+
+  - name: ingested_at
+    type: TIMESTAMP
+    nullable: false
+    comment: "Server-side ingestion timestamp from ZeroBus"
+
+  - name: user_id
+    type: STRING
+    nullable: true
+    comment: "Authenticated user ID from JWT claims"
+
+  - name: source_platform
+    type: STRING
+    nullable: true
+    comment: "Data source platform identifier"
+
+  - name: activity_date
+    type: DATE
+    nullable: true
+    comment: "Calendar date for the activity summary (one per user per day)"
+
+  - name: energy_burned_kcal
+    type: DOUBLE
+    nullable: true
+    comment: "Active energy burned (Move ring value) in kilocalories"
+
+  - name: energy_goal_kcal
+    type: DOUBLE
+    nullable: true
+    comment: "Daily Move ring goal in kilocalories"
+
+  - name: exercise_minutes
+    type: INT
+    nullable: true
+    comment: "Exercise minutes logged (Exercise ring value)"
+
+  - name: exercise_goal_minutes
+    type: INT
+    nullable: true
+    comment: "Daily Exercise ring goal in minutes"
+
+  - name: stand_hours
+    type: INT
+    nullable: true
+    comment: "Stand hours completed (Stand ring value)"
+
+  - name: stand_goal_hours
+    type: INT
+    nullable: true
+    comment: "Daily Stand ring goal in hours"
+
+  - name: energy_goal_pct
+    type: DOUBLE
+    nullable: true
+    comment: "Derived: energy_burned / energy_goal (1.0 = Move ring closed)"
+
+  - name: exercise_goal_pct
+    type: DOUBLE
+    nullable: true
+    comment: "Derived: exercise_minutes / exercise_goal (1.0 = Exercise ring closed)"
+
+  - name: stand_goal_pct
+    type: DOUBLE
+    nullable: true
+    comment: "Derived: stand_hours / stand_goal (1.0 = Stand ring closed)"
+
+constraints:
+  primary_key:
+    name: bronze_typed_activity_summaries_pk
+    columns:
+      - record_id
+  foreign_keys:
+    - name: bronze_typed_activity_summaries_bronze_fk
+      columns:
+        - record_id
+      references:
+        table: wearables_zerobus
+        columns:
+          - record_id
+
+expectations:
+  drop:
+    valid_record_id: "record_id IS NOT NULL"
+  warn:
+    valid_user: "user_id IS NOT NULL"
+    valid_date: "activity_date IS NOT NULL"
+    valid_energy_goal: "energy_goal_kcal > 0"
+    valid_exercise_goal: "exercise_goal_minutes > 0"
+    valid_stand_goal: "stand_goal_hours > 0"
+    non_negative_energy: "energy_burned_kcal >= 0"
+    reasonable_exercise: "exercise_minutes >= 0 AND exercise_minutes <= 1440"
+    reasonable_stand: "stand_hours >= 0 AND stand_hours <= 24"
+    reasonable_energy_burned: "energy_burned_kcal < 10000"
+    reasonable_date: "activity_date >= '2020-01-01' AND activity_date <= current_date()"
+    goal_attainment_finite: >-
+      energy_goal_pct IS NOT NULL AND NOT isnan(energy_goal_pct)
+      AND exercise_goal_pct IS NOT NULL AND NOT isnan(exercise_goal_pct)
+      AND stand_goal_pct IS NOT NULL AND NOT isnan(stand_goal_pct)

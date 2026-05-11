@@ -1,0 +1,108 @@
+# bronze_typed_sleep_stages — DDL fixture
+# Individual sleep stages exploded from session-level VARIANT data.
+#
+# Note: ingested_at and stage_uuid are nullable in the declared schema even
+# though they are logically required — the two-stage select + explode pattern
+# loses NOT NULL metadata from the source. The expect_or_drop expectations
+# enforce the business rule instead.
+
+table:
+  name: bronze_typed_sleep_stages
+  layer: bronze
+  type: streaming_table
+  comment: >
+    Individual sleep stages exploded from session-level VARIANT data.
+    One row per stage (asleepDeep, asleepREM, asleepCore, awake).
+    Append-only audit trail — stage-level deletes applied at silver via AUTO CDC.
+    CDC key: stage_uuid. Session reconstruction happens at gold layer.
+  properties:
+    quality: bronze
+    delta.enableChangeDataFeed: "true"
+    delta.enableRowTracking: "true"
+  cluster_by:
+    - user_id
+    - sleep_date
+
+columns:
+  - name: record_id
+    type: STRING
+    nullable: false
+    comment: "Bronze record GUID — NOT unique here (one session explodes to many stages)"
+
+  - name: ingested_at
+    type: TIMESTAMP
+    nullable: true
+    comment: "Server-side ingestion timestamp from ZeroBus (AUTO CDC sequence key)"
+
+  - name: user_id
+    type: STRING
+    nullable: true
+    comment: "Authenticated user ID from JWT claims"
+
+  - name: source_platform
+    type: STRING
+    nullable: true
+    comment: "Data source platform identifier"
+
+  - name: stage_uuid
+    type: STRING
+    nullable: true
+    comment: "Per-stage HealthKit UUID — primary key, CDC dedup key (one per sleep stage)"
+
+  - name: stage
+    type: STRING
+    nullable: true
+    comment: "Sleep stage type: asleepDeep, asleepREM, asleepCore, or awake"
+
+  - name: stage_start_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Stage start timestamp (UTC)"
+
+  - name: stage_end_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Stage end timestamp (UTC)"
+
+  - name: stage_duration_minutes
+    type: DOUBLE
+    nullable: true
+    comment: "Derived: (stage_end_ts - stage_start_ts) in minutes"
+
+  - name: session_start_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Parent sleep session start (UTC, for grouping stages into sessions)"
+
+  - name: session_end_ts
+    type: TIMESTAMP
+    nullable: true
+    comment: "Parent sleep session end (UTC)"
+
+  - name: sleep_date
+    type: DATE
+    nullable: true
+    comment: "Date of session onset for liquid clustering and daily aggregation"
+
+constraints:
+  primary_key:
+    name: bronze_typed_sleep_stages_pk
+    columns:
+      - stage_uuid
+  # No FK to wearables_zerobus because record_id is not unique here
+  # (one sleep session record explodes into many stage rows)
+  foreign_keys: []
+
+expectations:
+  drop:
+    valid_record_id: "record_id IS NOT NULL"
+    valid_stage_uuid: "stage_uuid IS NOT NULL"
+  warn:
+    valid_user: "user_id IS NOT NULL"
+    valid_stage_type: "stage IN ('asleepDeep', 'asleepREM', 'asleepCore', 'awake')"
+    valid_stage_timestamps: "stage_start_ts IS NOT NULL AND stage_end_ts IS NOT NULL"
+    chronological_stage: "stage_start_ts < stage_end_ts"
+    positive_duration: "stage_duration_minutes > 0"
+    reasonable_stage_duration: "stage_duration_minutes <= 720"
+    reasonable_timestamp: "stage_start_ts >= '2020-01-01' AND stage_start_ts <= current_timestamp()"
+    stage_within_session: "stage_start_ts >= session_start_ts AND stage_end_ts <= session_end_ts"
