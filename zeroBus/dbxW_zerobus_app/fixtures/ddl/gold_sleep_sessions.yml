@@ -1,10 +1,20 @@
 # gold_sleep_sessions — DDL fixture
 # Session-level sleep aggregation from stage-level silver data.
+#
+# IMPLEMENTATION NOTE:
+# This MV is defined in SQL (not Python) to enable column-level COMMENT clauses:
+#   src/pipelines/transformations/gold_and_quarantine.sql
+#
+# The SQL file uses CREATE MATERIALIZED VIEW with an explicit column list.
+# Column comments below are the canonical source — keep them in sync with
+# the SQL definition. The table comment, properties, and cluster_by are also
+# specified directly in the SQL DDL (not loaded via lib.table_config).
 
 table:
   name: gold_sleep_sessions
   layer: gold
   type: materialized_view
+  implementation: sql  # gold_and_quarantine.sql (not Python config-driven)
   comment: >
     Sleep sessions reconstructed from stage-level silver data.
     One row per user per session with per-stage duration breakdown,
@@ -17,9 +27,8 @@ table:
     - user_id
     - sleep_date
 
-# Column comments for materialized views are documentation-only in YAML.
-# The MV schema is inferred from the query — column comments cannot be
-# applied via schema DDL on MVs. These serve as the authoritative reference.
+# Column comments are applied via the SQL DDL column list in
+# gold_and_quarantine.sql. This YAML is the canonical reference.
 columns:
   - name: user_id
     type: STRING

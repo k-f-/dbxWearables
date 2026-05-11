@@ -23,6 +23,10 @@
 #
 # Mode: Continuous — processes new bronze records as they arrive.
 # Compute: Serverless (Photon-enabled).
+#
+# Architecture:
+#   - silver_healthkit.py — Bronze typed + CDC views + Silver (Python, config-driven)
+#   - gold_and_quarantine.sql — Gold + Quarantine MVs (SQL, explicit column comments)
 
 resources:
   pipelines:
@@ -35,6 +39,8 @@ resources:
       libraries:
         - file:
             path: ../src/pipelines/transformations/silver_healthkit.py
+        - file:
+            path: ../src/pipelines/transformations/gold_and_quarantine.sql
 
       root_path: ../src/pipelines
 
