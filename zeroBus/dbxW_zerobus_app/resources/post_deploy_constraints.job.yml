@@ -1,40 +1,41 @@
 # Post-Deploy Constraints Job
 #
-# Applies PK/FK RELY constraints and column comments to all pipeline tables
-# after the HealthKit SDP pipeline has completed its first successful update.
+# DISABLED: All tables in the pipeline schema are Streaming Tables or
+# Materialized Views managed by the SDP pipeline. Databricks does NOT allow
+# ALTER TABLE operations (column comments, ADD CONSTRAINT) on pipeline-managed
+# tables — only the pipeline's CREATE OR REFRESH can modify them.
 #
-# Run on-demand after pipeline deploys (no schedule).
-# Idempotent — safe to re-run; ADD CONSTRAINT is a no-op if constraint exists.
+# Column documentation lives in:
+#   - Table-level `comment` parameter in silver_healthkit.py (@dp.table, dp.create_streaming_table)
+#   - src/pipelines/transformations/README.md (full column descriptions)
+#
+# PK/FK constraints are not supported on streaming tables.
+# If Databricks adds support in the future, uncomment and re-enable.
+#
+# See: [STREAMING_TABLE_OPERATION_NOT_ALLOWED.INVALID_ALTER]
 
-resources:
-  jobs:
-    post_deploy_constraints:
-      name: "[${bundle.target}] HealthKit Post-Deploy Constraints"
-
-      tasks:
-        - task_key: apply_constraints
-          notebook_task:
-            notebook_path: ../src/ops/silver-healthkit-constraints.ipynb
-            base_parameters:
-              catalog: ${var.catalog}
-              schema: ${var.schema}
-          environment_key: default
-
-      environments:
-        - environment_key: default
-          spec:
-            client: ${var.serverless_environment_version}
-
-      tags:
-        project: ${var.tags_project}
-        business_unit: ${var.tags_businessUnit}
-        developer: ${var.tags_developer}
-
-      run_as:
-        user_name: ${var.run_as_user}
-
-      permissions:
-        - level: CAN_VIEW
-          group_name: "users"
-
-      # No schedule — triggered manually or by deploy.sh after pipeline updates
+# resources:
+#   jobs:
+#     post_deploy_constraints:
+#       name: "[${bundle.target}] HealthKit Post-Deploy Constraints"
+#       tasks:
+#         - task_key: apply_constraints
+#           notebook_task:
+#             notebook_path: ../src/ops/silver-healthkit-constraints.ipynb
+#             base_parameters:
+#               catalog: ${var.catalog}
+#               schema: ${var.schema}
+#           environment_key: default
+#       environments:
+#         - environment_key: default
+#           spec:
+#             client: ${var.serverless_environment_version}
+#       tags:
+#         project: ${var.tags_project}
+#         business_unit: ${var.tags_businessUnit}
+#         developer: ${var.tags_developer}
+#       run_as:
+#         user_name: ${var.run_as_user}
+#       permissions:
+#         - level: CAN_VIEW
+#           group_name: "users"
